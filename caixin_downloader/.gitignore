@@ -1,0 +1,4 @@
+*.epub
+cookies.json
+.venv/
+__pycache__/
