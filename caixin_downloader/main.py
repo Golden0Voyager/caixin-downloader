@@ -1,357 +1,591 @@
+# /// script
+# dependencies = [
+#   "playwright",
+#   "beautifulsoup4",
+#   "ebooklib",
+#   "questionary",
+#   "rich",
+# ]
+# ///
+
 import asyncio
 import json
 import uuid
 import re
 import os
+import time
 import hashlib
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from ebooklib import epub
+import questionary
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from rich.table import Table
 
 COOKIES_FILE = "cookies.json"
+VERSION = "2.2"
+
+console = Console()
+
+DISCLAIMER = """
+[bold red]免责声明 / Disclaimer[/bold red]
+
+本程序仅供个人学习、研究及测试使用，通过自动化技术辅助获取已订阅内容。
+严禁将本程序及生成的电子书用于任何商业用途或大规模传播。
+This program is for personal learning, research, and testing purposes only.
+Commercial use or large-scale distribution is strictly prohibited.
+
+下载内容的版权归财新传媒 (Caixin Media) 所有。请在下载后 24 小时内删除。
+The copyright of the content belongs to Caixin Media. Please delete after 24 hours.
+用户需自行承担因不当使用该工具而产生的任何法律责任。
+Users shall bear all legal responsibilities arising from improper use of this tool.
+"""
+
+async def safe_goto(page, url, retries=3, timeout=60000):
+    """带重试机制的页面跳转"""
+    for i in range(retries):
+        try:
+            return await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        except Exception as e:
+            if i == retries - 1: raise e
+            await asyncio.sleep(2 * (i + 1))
 
 class ImageManager:
     """管理电子书中的图片下载与嵌入"""
     def __init__(self, context):
         self.context = context
         self.images = {}  # url -> {id, bytes, mime, filename}
-        self.used_urls = set()
 
-    async def download(self, url):
+    async def download(self, url, retries=2):
+        if not url: return None
         if url in self.images:
             return self.images[url]["filename"]
         
-        try:
-            # 处理相对路径
-            if url.startswith("//"):
-                url = "https:" + url
-            
-            print(f"  🖼️ 下载图片: {url[:60]}...")
-            response = await self.context.request.get(url, timeout=10000)
-            if response.status == 200:
-                content = await response.body()
-                ext = url.split(".")[-1].split("?")[0].lower()
-                if ext not in ["jpg", "jpeg", "png", "gif", "webp"]:
+        # 补全 URL
+        if url.startswith("//"): url = "https:" + url
+        elif not url.startswith("http"): return None
+
+        for i in range(retries):
+            try:
+                response = await self.context.request.get(url, timeout=15000)
+                if response.status == 200:
+                    content = await response.body()
+                    if not content: continue
+                    
+                    # 智能探测扩展名
                     ext = "jpg"
-                
-                # 生成唯一且确定的文件名
-                img_hash = hashlib.md5(url.encode()).hexdigest()
-                filename = f"images/{img_hash}.{ext}"
-                mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
-                
-                self.images[url] = {
-                    "id": f"img_{img_hash}",
-                    "content": content,
-                    "mime": mime,
-                    "filename": filename
-                }
-                return filename
-        except Exception as e:
-            print(f"  ⚠️ 图片下载失败: {e}")
+                    if "image/png" in response.headers.get("content-type", ""): ext = "png"
+                    elif "image/gif" in response.headers.get("content-type", ""): ext = "gif"
+                    elif "image/webp" in response.headers.get("content-type", ""): ext = "webp"
+                    else:
+                        path_ext = url.split(".")[-1].split("?")[0].lower()
+                        if path_ext in ["png", "gif", "webp", "jpeg", "jpg"]: ext = path_ext
+
+                    img_hash = hashlib.md5(url.encode()).hexdigest()
+                    filename = f"images/{img_hash}.{ext}"
+                    mime = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else ext}"
+                    
+                    self.images[url] = {"id": f"img_{img_hash}", "content": content, "mime": mime, "filename": filename}
+                    return filename
+                break
+            except Exception:
+                await asyncio.sleep(1)
         return None
 
-async def scrape_article(page, url, image_manager):
+async def scrape_article(page, url, image_manager, default_title=None):
     """抓取单篇文章的正文内容并处理图片"""
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2000)
-    
-    html = await page.content()
-    soup = BeautifulSoup(html, "html.parser")
-    
-    title_tag = soup.find("h1")
-    title = title_tag.text.strip() if title_tag else "未知标题"
-    
-    author_info = ""
-    author_tag = soup.select_one(".author, .artInfo, #author_top")
-    if author_tag:
-        author_info = author_tag.get_text(strip=True)
+    try:
+        await safe_goto(page, url)
+        await page.wait_for_timeout(2000)
         
-    content_div = soup.find(id="Main_Content_Val")
-    if not content_div:
-        content_div = soup.select_one(".text, .article-content, article")
+        # 针对付费内容的特殊等待（如果有的话）
+        html = await page.content()
+        soup = BeautifulSoup(html, "html.parser")
         
-    if not content_div:
+        # 1. 标题提取
+        title = "未知标题"
+        title_tag = soup.select_one("h1, .wiv-title, .art-title, .title, #conTit h1")
+        if title_tag: 
+            title = title_tag.get_text(strip=True)
+        elif default_title: 
+            title = default_title
+        title = re.sub(r"\{\{.*?\}\}", "", title).strip() # 移除模板残留
+                
+        # 2. 作者提取
+        author_info = ""
+        author_selectors = [".author", ".artInfo", "#author_top", ".editor-name", ".media-name"]
+        for s in author_selectors:
+            tag = soup.select_one(s)
+            if tag:
+                author_info = tag.get_text(separator=" ", strip=True)
+                if "本文来源于" in author_info: author_info = ""
+                if author_info: break
+            
+        # 3. 正文提取
+        content_div = soup.find(id="Main_Content_Val") or soup.select_one(".text, .article-content, article, #main_content, .art-content")
+        if not content_div: return None
+
+        # 4. 清理无效元素
+        blacklist = [
+            "script", "style", "canvas", ".share", ".ad", ".bottom-adv", 
+            ".media-box", ".aitt", ".copyright", ".watermark", ".mask", 
+            ".hide", ".hidden", ".artInfo-box", ".read-all", ".pay-all", 
+            ".copyright-box", ".related-articles", ".recommend", ".keyword"
+        ]
+        for selector in blacklist:
+            for tag in content_div.select(selector): tag.decompose()
+            
+        # 5. 水印与垃圾文本清理
+        for tag in content_div.find_all(True):
+            text = tag.get_text(strip=True)
+            watermark_kws = ["财新网版权", "翻录必究", "财新版权", "翻版必究", "此材料受版权保护", "摘录来自", "本文为财新"]
+            if (any(k in text for k in watermark_kws) and len(text) < 180) or re.match(r"^\d{10,}$", text):
+                tag.decompose(); continue
+            
+            # 清理空的或只有空白字符的标签 (非自闭合标签)
+            if not text and not tag.find_all() and tag.name not in ["img", "br", "hr"]:
+                tag.decompose(); continue
+
+        # 6. 图片处理 (支持懒加载)
+        img_tags = content_div.find_all("img")
+        img_urls = []
+        for img in img_tags:
+            # 候选属性列表
+            src = img.get("data-src") or img.get("data-original-src") or img.get("src")
+            img_urls.append(src)
+            
+        if img_urls:
+            local_paths = await asyncio.gather(*[image_manager.download(u) for u in img_urls])
+            for idx, img in enumerate(img_tags):
+                path = local_paths[idx]
+                if path:
+                    figure = soup.new_tag("figure", attrs={"class": "article-figure"})
+                    img.attrs = {"src": path, "class": "article-img"}
+                    
+                    # 提取图注
+                    cap_text = ""
+                    # 尝试寻找兄弟节点的图注
+                    nxt = img.find_next_sibling()
+                    for _ in range(2):
+                        if nxt and nxt.name in ["p", "div", "span"]:
+                            n_cls = nxt.get("class", [])
+                            if isinstance(n_cls, str): n_cls = [n_cls]
+                            caption_classes = ["imageText", "caption", "artInfo", "pic_content", "source", "img-caption", "pic_info"]
+                            if any(c in n_cls for c in caption_classes) or nxt.get("id") == "pic_info":
+                                cap_text = nxt.get_text(strip=True); nxt.decompose(); break
+                        if nxt: nxt = nxt.find_next_sibling()
+                    
+                    img.wrap(figure)
+                    if cap_text:
+                        fcap = soup.new_tag("figcaption", attrs={"class": "article-caption"})
+                        fcap.string = cap_text; figure.append(fcap)
+                else:
+                    img.decompose()
+
+        # 7. 属性清洗 (移除所有 ID 和不必要的 Class)
+        preserved_classes = {"lead", "quote", "author-bar", "content-body", "article-figure", "article-img", "article-caption"}
+        for tag in content_div.find_all(True):
+            if tag.name == "img": continue
+            c_cls = tag.get("class", [])
+            if isinstance(c_cls, str): c_cls = [c_cls]
+            n_attrs = {}
+            valid_classes = [c for c in c_cls if c in preserved_classes]
+            if valid_classes: n_attrs["class"] = " ".join(valid_classes)
+            tag.attrs = n_attrs
+
+        # 8. 组装 HTML
+        article_html = f"<div class='article-header'><h1 class='article-title'>{title}</h1>"
+        if author_info: article_html += f"<div class='author-bar'>{author_info}</div>"
+        article_html += f"</div><div class='content-body'>{str(content_div)}</div>"
+        article_html = re.sub(r"\{\{.*?\}\}", "", article_html)
+        article_html += "<div class='article-footer'><a href='contents.xhtml' class='back-to-toc'>回到目录 / Back to TOC</a></div>"
+        
+        return {"title": title, "html": article_html, "url": url}
+    except Exception as e:
+        console.log(f"[dim]抓取异常 ({url}): {e}[/dim]")
         return None
 
-    for tag in content_div.select("script, style, .share, .ad, .bottom-adv, .media-box"):
-        tag.decompose()
-        
-    # 处理文章中的图片
-    for img_tag in content_div.find_all("img"):
-        src = img_tag.get("src")
-        if src:
-            local_path = await image_manager.download(src)
-            if local_path:
-                img_tag["src"] = local_path
-            else:
-                img_tag.decompose()
-
-    # 深度清洗：移除所有标签的冗余属性 (class, id, style 等)
-    for tag in content_div.find_all(True):
-        if tag.name == "img":
-            # 只保留 src
-            src = tag.get("src")
-            tag.attrs = {"src": src}
-        else:
-            # 移除所有属性，让 CSS 统一控制
-            tag.attrs = {}
-
-    # 组装更具语义化的 HTML
-    article_html = f"<h1 class='article-title'>{title}</h1>"
-    if author_info:
-        article_html += f"<div class='author-bar'>{author_info}</div>"
-    
-    # 包装正文
-    article_html += f"<div class='content-body'>{str(content_div)}</div>"
-
-    return {
-        "title": title,
-        "html": article_html,
-        "url": url
-    }
-
-async def get_toc(page, issue_url):
-    """获取目录、期号和封面"""
-    print(f"📥 正在获取目录: {issue_url}")
-    await page.goto(issue_url, wait_until="networkidle", timeout=60000)
+async def get_toc(page, issue_url=None):
+    if issue_url: await page.goto(issue_url, wait_until="networkidle", timeout=60000)
     html = await page.content()
     soup = BeautifulSoup(html, "html.parser")
-    
-    # 1. 提取封面图和期号 ID (从中间区域 .mi 提取)
     cover_url = None
     issue_id = "Latest"
-    mi_div = soup.select_one(".mi")
-    if mi_div:
-        cover_tag = mi_div.find("img")
-        if cover_tag:
-            cover_url = cover_tag.get("src")
-        a_tag = mi_div.find("a", href=True)
-        if a_tag:
-            # 从 https://weekly.caixin.com/2026/cw1194/ 提取 cw1194
-            match = re.search(r"cw(\d+)", a_tag["href"])
-            if match:
-                issue_id = match.group(0)
-
-    # 2. 提取期数标题
-    issue_no = "XX"
-    issue_title = f"财新周刊 {issue_id}"
-    
-    # 策略 A: 寻找包含“202x年第xx期”的文本节点
-    text_match = soup.find(string=re.compile(r"202\d年第\d+期"))
-    if text_match:
-        issue_title = text_match.strip()
-        no_match = re.search(r"第(\d+)期", issue_title)
-        if no_match:
-            issue_no = no_match.group(1)
-    else:
-        # 策略 B: 从往期列表的第一项推断当前期号 (往期+1)
-        latest_past = soup.select_one(".xsjCon li")
-        if latest_past:
-            text = latest_past.get_text()
-            match = re.search(r"年度期号:(\d+)", text)
-            if match:
-                curr_no_int = int(match.group(1)) + 1
-                issue_no = f"{curr_no_int:02d}"
-                issue_title = f"财新周刊 2026年第{issue_no}期 ({issue_id})"
-
-    # 3. 提取本期文章链接
+    for s in [".mi img", ".fm img", ".mains img", ".leftCon img", ".cover img"]:
+        tag = soup.select_one(s)
+        if tag and tag.get("src"): cover_url = tag.get("src"); break
+    mi_div = soup.select_one(".mi, .fm, .mains")
+    if mi_div and mi_div.find("a", href=True):
+        m = re.search(r"cw(\d+)", mi_div.find("a")["href"])
+        if m: issue_id = m.group(0)
+    issue_no, issue_title = "XX", f"《财新周刊》 {issue_id}"
+    text_m = soup.find(string=re.compile(r"202\d年第\d+期"))
+    if text_m:
+        raw = text_m.strip().replace("{{", "").replace("}}", "")
+        cm = re.search(r"(《财新周刊》\s*\d{4}年第\d+期)", raw)
+        issue_title = cm.group(1) if cm else raw.split("出版日期")[0].strip()
+        nm = re.search(r"第(\d+)期", issue_title)
+        if nm: issue_no = nm.group(1)
+    past_issues = []
+    for li in soup.select(".xsjCon li"):
+        text = li.get_text(separator=" ", strip=True).replace("{{", "").replace("}}", "")
+        dm, nm = re.search(r"(\d{4}年\d{2}月\d{2}日)", text), re.search(r"年度期号:(\d+)", text)
+        p = [p.strip() for p in text.split(" ") if p.strip()]
+        a = li.find("a", href=True)
+        cwm = re.search(r"cw\d+", a["href"]) if a else None
+        if cwm: past_issues.append({"id": cwm.group(0), "date": dm.group(1) if dm else "", "no": nm.group(1) if nm else "", "title": p[0] if p else "", "url": a["href"]})
     links = []
     seen = set()
-    
-    # 定义文章链接的正则匹配模式
-    def is_article_link(url):
-        # 匹配 2026-02-13/102414391.html 这种格式
-        return "weekly.caixin.com/202" in url and url.endswith(".html")
+    containers = [t for t in [soup.select_one(".lf"), soup.select_one(".ri"), soup.select_one(".mi")] if t] or [soup]
+    for c in containers:
+        for a in c.find_all("a", href=True):
+            h = a["href"]
+            if ".caixin.com/202" in h and h.endswith(".html"):
+                if h not in seen:
+                    seen.add(h); t = re.sub(r'\s+', ' ', a.get_text(strip=True)).replace("{{", "").replace("}}", "")
+                    if len(t) > 2 and "期号" not in t: links.append({"title": t, "url": h})
+    return {"issue_title": issue_title, "issue_no": issue_no, "cover_url": cover_url, "links": links, "past_issues": past_issues}
 
-    # 尝试在特定区域抓取，如果没找到，则全页抓取
-    targets = [soup.select_one(".lf"), soup.select_one(".ri"), soup.select_one(".mi")]
-    containers = [t for t in targets if t]
-    
-    if not containers or "/cw" in page.url: # 如果在专属目录页，直接全页扫描
-        containers = [soup]
-
-    for container in containers:
-        for a in container.find_all("a", href=True):
-            href = a["href"]
-            if is_article_link(href):
-                if href not in seen:
-                    seen.add(href)
-                    title = re.sub(r'\s+', ' ', a.get_text(strip=True))
-                    # 过滤掉一些过短或无意义的标题
-                    if len(title) > 2 and "期号" not in title: 
-                        links.append({"title": title, "url": href})
-                    
-    return {
-        "issue_title": issue_title,
-        "issue_no": issue_no,
-        "cover_url": cover_url,
-        "links": links
-    }
-
-def create_epub(articles, info, image_manager, filename="Caixin_Weekly.epub"):
-    """打包 EPUB：支持自定义目录页、跨页分离和高级样式"""
-    print(f"📚 开始组装 EPUB: {filename} ...")
+def create_epub(articles, info, image_manager, filename):
     book = epub.EpubBook()
     book.set_identifier(str(uuid.uuid4()))
     book.set_title(info["issue_title"])
     book.set_language('zh-CN')
     book.add_author("财新周刊")
     
-    # 1. 注入高级样式表
     style = '''
-    body { font-family: "PingFang SC", "Source Han Sans CN", sans-serif; line-height: 1.8; padding: 0 5%; color: #333; }
-    
-    /* 目录页专用样式 */
-    .toc-container { padding: 5% 5%; }
-    .toc-header { font-size: 2.2em; border-bottom: 3px solid #000; padding-bottom: 10px; margin-bottom: 40px; font-weight: bold; }
+    body { font-family: "STSong", "Songti SC", "PingFang SC", serif; line-height: 1.85; padding: 0 2%; color: #1a1a1a; text-align: justify; }
+    .toc-container { padding: 8% 5%; }
+    .toc-header { font-size: 2.2em; border-bottom: 4px solid #000; padding-bottom: 12px; margin-bottom: 40px; font-weight: bold; }
+    .toc-cover { width: 100%; max-width: 280px; margin-bottom: 30px; box-shadow: 0 8px 15px rgba(0,0,0,0.1); }
     .toc-list { list-style: none; padding: 0; }
-    .toc-item { margin: 15px 0; border-bottom: 1px dashed #ddd; padding-bottom: 8px; display: block; text-decoration: none; color: #333; }
-    .toc-item-title { font-size: 1.15em; font-weight: bold; }
-    
-    /* 正文样式 */
-    .article-title { font-size: 1.8em; font-weight: bold; line-height: 1.3; margin-top: 1.5em; margin-bottom: 0.5em; text-align: left; }
-    .author-bar { font-size: 0.9em; color: #888; margin-bottom: 2.5em; padding-bottom: 0.5em; border-bottom: 1px solid #eee; }
-    .content-body { font-size: 1.1em; text-align: justify; }
-    .content-body p { margin: 1.2em 0; }
-    .content-body p + p { text-indent: 2em; }
-    img { max-width: 100%; height: auto; display: block; margin: 2em auto; border-radius: 4px; }
-    h2, h3 { color: #000; margin-top: 2em; border-left: 4px solid #333; padding-left: 10px; }
+    .toc-item { margin: 18px 0; border-bottom: 1px solid #f0f0f0; padding-bottom: 10px; display: block; text-decoration: none; color: #222; }
+    .article-header { margin: 3em 0 4em 0; text-align: center; }
+    .article-title { font-size: 2.2em; font-weight: bold; line-height: 1.2; margin-bottom: 0.8em; }
+    .content-body { font-size: 1.1em; }
+    .content-body p { margin: 1.6em 0; text-indent: 2em; }
+    .content-body p:first-of-type { text-indent: 0; font-weight: bold; }
+    .article-figure { margin: 3.5em 0; text-align: center; }
+    .article-img { width: 100% !important; height: auto; display: block; margin: 0 auto; }
+    .article-caption { font-size: 0.82em; color: #666; font-style: italic; text-align: center; margin-top: 0.8em; padding: 0 8%; }
+    .back-to-toc { display: inline-block; padding: 12px 30px; border: 1.5px solid #222; text-decoration: none; color: #222; font-weight: bold; border-radius: 30px; }
     '''
-    default_css = epub.EpubItem(uid="style_default", file_name="style/default.css", media_type="text/css", content=style)
-    book.add_item(default_css)
+    book.add_item(epub.EpubItem(uid="style_default", file_name="style/default.css", media_type="text/css", content=style))
     
-    # 2. 嵌入图片资源
     for url, data in image_manager.images.items():
-        img_item = epub.EpubItem(uid=data["id"], file_name=data["filename"], media_type=data["mime"], content=data["content"])
-        book.add_item(img_item)
+        book.add_item(epub.EpubItem(uid=data["id"], file_name=data["filename"], media_type=data["mime"], content=data["content"]))
 
-    # 3. 设置封面
-    if info.get("cover_data"):
+    if info.get("cover_data"): 
         book.set_cover("images/cover.jpg", info["cover_data"])
 
-    # 4. 创建自定义目录页 (CONTENTS)
-    toc_html = '<div class="toc-container"><div class="toc-header">目录 / CONTENTS</div><div class="toc-list">'
+    # 1. 创建自定义目录页 (CONTENTS)
+    clean_it = info["issue_title"].replace("《", "").replace("》", "")
+    toc_html = f'<div class="toc-container"><div class="toc-header">《{clean_it}》 · 目录</div>'
+    if info.get("cover_data"): toc_html += '<img src="images/cover.jpg" class="toc-cover" />'
+    toc_html += '<div class="toc-list">'
     for i, art in enumerate(articles):
-        toc_html += f'<a class="toc-item" href="chapter_{i}.xhtml"><div class="toc-item-title">{art["title"]}</div></a>'
+        clean_t = art["title"].replace("{{", "").replace("}}", "").strip()
+        toc_html += f'<a class="toc-item" href="chapter_{i}.xhtml"><div class="toc-item-title">{i+1}. {clean_t}</div></a>'
     toc_html += '</div></div>'
     
-    contents_page = epub.EpubHtml(title="目录", file_name="contents.xhtml", lang='zh-CN')
-    contents_page.content = f'<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body>{toc_html}</body></html>'
-    book.add_item(contents_page)
+    cp = epub.EpubHtml(uid="contents", title="目录", file_name="contents.xhtml", content=f'<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body>{toc_html}</body></html>', lang='zh-CN')
+    book.add_item(cp)
+    
+    # 2. 创建空白页
+    bp = epub.EpubHtml(uid="blank", title=" ", file_name="blank.xhtml", content='<html><body><div style="height:100vh;"></div></body></html>', lang='zh-CN')
+    book.add_item(bp)
 
-    # 5. 创建空白过渡页 (用于跨页分离)
-    blank_page = epub.EpubHtml(title=" ", file_name="blank.xhtml", lang='zh-CN')
-    blank_page.content = '<html><body><div style="height:100vh;"></div></body></html>'
-    book.add_item(blank_page)
-
-    # 6. 生成文章章节
+    # 3. 生成文章章节
     spine_chapters = []
-    toc_links = []
     for i, art in enumerate(articles):
-        chapter = epub.EpubHtml(title=art["title"], file_name=f"chapter_{i}.xhtml", lang='zh-CN')
-        chapter.content = f'<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body>{art["html"]}</body></html>'
-        book.add_item(chapter)
-        spine_chapters.append(chapter)
-        toc_links.append(chapter)
+        ch = epub.EpubHtml(uid=f"chapter_{i}", title=art["title"], file_name=f"chapter_{i}.xhtml", content=f'<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body>{art["html"]}</body></html>', lang='zh-CN')
+        book.add_item(ch)
+        spine_chapters.append(ch)
         
-    # 系统级目录 (侧边栏)
-    book.toc = tuple(toc_links)
+    # 4. 设置系统导航和阅读顺序
+    book.toc = tuple(spine_chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    
-    # 7. 设定阅读顺序 (Spine)
-    # 顺序：系统导航 -> 自定义目录页 -> 空白过渡页 -> 正文
-    book.spine = ['nav', contents_page, blank_page] + spine_chapters
+    book.spine = ['nav', cp, bp] + spine_chapters
     
     epub.write_epub(filename, book, {})
-    print(f"✅ 成功保存至: {Path(filename).absolute()}")
+    console.print(Panel(f"[bold green]✅ 成功保存至:[/bold green] [cyan]{Path(filename).absolute()}[/cyan]", border_style="green"))
+
+async def process_one_issue(issue_id, issue_url, selected_past, home_info, context):
+    """处理单期下载的核心逻辑"""
+    console.print(f"\n[bold blue]>>> 正在处理:[/bold blue] [yellow]{issue_id}[/yellow]")
+    page = await context.new_page()
+    try:
+        image_manager = ImageManager(context)
+        info = await get_toc(page, issue_url)
+        
+        # 深度年份探测 (针对手动输入)
+        if not info["links"] and selected_past is None:
+            for y in range(datetime.now().year, 2020, -1):
+                alt = f"https://weekly.caixin.com/{y}/{issue_id}/"
+                console.print(f"🔍 尝试年份 {y}...")
+                try:
+                    info = await get_toc(page, alt)
+                    if info["links"]: break
+                except Exception: continue
+
+        if not selected_past:
+            selected_past = {"date": datetime.now().strftime("%Y年%m月%d日"), "no": info["issue_no"], "title": info["issue_title"]}
+
+        cover_url = info.get("cover_url") or home_info["cover_url"]
+        if cover_url:
+            try:
+                res = await context.request.get(cover_url)
+                if res.status == 200: info["cover_data"] = await res.body()
+            except Exception as e:
+                console.print(f"[dim]封面下载跳过: {e}[/dim]")
+        
+        links = info["links"][:35] # 放宽限制至35
+        if not links:
+            console.print(f"[bold red]❌ 未能在 {issue_id} 中找到有效文章链接。[/bold red]")
+            return
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True # 完成后自动清除进度条，保持界面干净
+        ) as progress:
+            task_id = progress.add_task(f"[cyan]🚀 正在下载《{selected_past['title']}》...", total=len(links))
+            semaphore, articles = asyncio.Semaphore(4), [None] * len(links)
+
+            async def worker(i, item):
+                async with semaphore:
+                    tp = None
+                    try:
+                        tp = await context.new_page()
+                        # 拦截不必要的广告和资源
+                        await tp.route("**/*.{png,jpg,jpeg,gif,webp}", lambda r: r.continue_() if "caixin.com" in r.request.url else r.abort())
+                        await tp.route("**/*", lambda r: r.abort() if any(x in r.request.url for x in ["analytics", "adserver", "fonts", "hm.baidu.com"]) else r.continue_())
+                        
+                        progress.update(task_id, description=f"[cyan]正在抓取: [white]{item['title'][:15]}...")
+                        data = await scrape_article(tp, item["url"], image_manager, default_title=item["title"])
+                        if data: articles[i] = data
+                    except Exception as e:
+                        console.print(f"[dim]文章抓取失败 ({item['title'][:10]}): {e}[/dim]")
+                    finally:
+                        if tp: await tp.close()
+                        progress.advance(task_id)
+
+            await asyncio.gather(*[worker(i, item) for i, item in enumerate(links)])
+            progress.update(task_id, description="[bold green]✅ 抓取完成")
+
+        if arts := [a for a in articles if a]:
+            filename = f"download/{selected_past['date']} (第{selected_past['no']}期) - {selected_past['title']}.epub"
+            os.makedirs("download", exist_ok=True)
+            create_epub(arts, info, image_manager, filename)
+        else:
+            console.print(f"[bold red]❌ {issue_id} 抓取结果为空。[/bold red]")
+            
+    except Exception as e:
+        console.print(f"[bold red]❌ 处理 {issue_id} 时发生致命错误:[/bold red] {e}")
+    finally:
+        await page.close()
 
 async def main():
-    print("🚀 财新周刊全自动下载打包引擎 v2.0")
+    start_time = time.time()
+    console.print(Panel(f"[bold cyan]财新周刊全自动下载引擎 v{VERSION}[/bold cyan]\n[dim]Caixin Weekly EPUB Generator[/dim]", border_style="cyan"))
+    console.print(Panel(DISCLAIMER.strip(), title="Disclaimer", border_style="red"))
     
-    # 加载 Cookie
+    try:
+        agree = await questionary.confirm("您是否已阅读并同意上述免责声明？/ Do you agree to the disclaimer?").ask_async()
+        if not agree:
+            console.print("[bold red]🚫 用户未同意声明，退出程序。[/bold red]"); return
+    except KeyboardInterrupt:
+        return
+
     pw_cookies = []
     try:
-        with open(COOKIES_FILE, "r") as f:
-            cookies = json.load(f)
-            for c in cookies:
-                pc = {"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c.get("path", "/")}
-                if "sameSite" in c and c["sameSite"] in ["Strict", "Lax", "None"]:
-                    pc["sameSite"] = c["sameSite"]
-                pw_cookies.append(pc)
+        if not os.path.exists(COOKIES_FILE):
+            console.print(f"[bold red]❌ 找不到 {COOKIES_FILE} 文件，请参考文档配置后重试。[/bold red]"); return
+            
+        with console.status("[bold green]正在加载认证信息..."):
+            with open(COOKIES_FILE, "r") as f:
+                cookies_data = json.load(f)
+                for c in cookies_data:
+                    pc = {"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c.get("path", "/")}
+                    if "sameSite" in c and c["sameSite"] in ["Strict", "Lax", "None"]: pc["sameSite"] = c["sameSite"]
+                    pw_cookies.append(pc)
     except Exception as e:
-        print(f"❌ 读取 Cookies 失败: {e}")
-        return
+        console.print(f"[bold red]❌ Cookies 解析错误:[/bold red] {e}"); return
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        await context.add_cookies(pw_cookies)
-        page = await context.new_page()
-        
-        image_manager = ImageManager(context)
-        
-        # 1. 第一步：从主页获取封面和期号 ID
-        print("🔍 正在主页寻找最新期号...")
-        home_info = await get_toc(page, "https://weekly.caixin.com/")
-        issue_id_match = re.search(r"cw\d+", home_info["issue_title"])
-        issue_id = issue_id_match.group(0) if issue_id_match else "Latest"
-        
-        # 2. 第二步：访问专属目录页抓取全部链接
-        full_toc_url = f"https://weekly.caixin.com/2026/{issue_id}/"
-        print(f"📥 正在专属目录页抓取完整文章列表: {full_toc_url}")
-        info = await get_toc(page, full_toc_url)
-        
-        # 3. 信息合并：如果专属目录页丢失了期号或封面，沿用主页获取的
-        info["cover_url"] = home_info["cover_url"]
-        if info["issue_no"] == "XX" and home_info["issue_no"] != "XX":
-            info["issue_no"] = home_info["issue_no"]
-            info["issue_title"] = home_info["issue_title"]
-        
-        # 设定抓取上限
-        links_to_fetch = info["links"][:30] 
-        
-        print(f"📋 识别期号: {info['issue_no']} ({info['issue_title']})")
-        print(f"🔗 找到 {len(info['links'])} 篇文章，准备下载前 {len(links_to_fetch)} 篇...")
-        
-        # 4. 下载封面
-        if info["cover_url"]:
-            print(f"🖼️ 正在下载封面图...")
-            try:
-                response = await context.request.get(info["cover_url"])
-                if response.status == 200:
-                    info["cover_data"] = await response.body()
-                    print(" ✅ 封面下载成功")
-            except Exception as e:
-                print(f" ⚠️ 封面下载报错: {e}")
-        
-        # 4. 抓取文章
-        articles = []
-        for i, item in enumerate(links_to_fetch):
-            print(f"[{i+1}/{len(links_to_fetch)}] {item['title'][:20]}...", end="", flush=True)
-            try:
-                art_data = await scrape_article(page, item["url"], image_manager)
-                if art_data:
-                    articles.append(art_data)
-                    print(" ✓")
-                else:
-                    print(" ❌ 无内容")
-            except Exception as e:
-                print(f" ⚠️ 错误: {e}")
-            await asyncio.sleep(2) 
+        try:
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            await context.add_cookies(pw_cookies)
+            page = await context.new_page()
             
-        await browser.close()
-        
-    if articles:
-        # 构造用户指定格式的文件名: 2026-财新周刊—第xx期260227
-        date_str = datetime.now().strftime("%y%m%d")
-        issue_no = info.get("issue_no", "XX")
-        filename = f"2026-财新周刊—第{issue_no}期{date_str}.epub"
-        create_epub(articles, info, image_manager, filename)
-    else:
-        print("❌ 未能抓取到文章。")
+            with console.status("[bold green]正在获取期刊列表..."):
+                home_info = await get_toc(page, "https://weekly.caixin.com/")
+            
+            # --- 极简版交互逻辑：回车即下载 ---
+            offset, page_size = 0, 12
+            selected_tasks = []
+
+            while True:
+                pasts = home_info.get("past_issues", [])
+                total = len(pasts)
+                current_page_items = pasts[offset : offset + page_size]
+
+                # 构建选项列表
+                choices = []
+                for p in current_page_items:
+                    # 状态保持：如果之前已选，则默认勾选
+                    is_checked = p["id"] in [t[0] for t in selected_tasks]
+                    choices.append(questionary.Choice(
+                        title=f"{p['id']} | {p['date']} | 第{p['no']}期", 
+                        value=p,
+                        checked=is_checked
+                    ))
+
+                choices.append(questionary.Separator("-" * 45))
+
+                # 智能导航选项
+                if offset + page_size < total:
+                    choices.append(questionary.Choice(title="[ ➔ 下一页 / Next Page ]", value="NEXT"))
+                else:
+                    choices.append(questionary.Choice(title="[ 🔄 加载更多 / Load More ]", value="MORE"))
+
+                if offset > 0:
+                    choices.append(questionary.Choice(title="[ ⬅ 上一页 / Prev Page ]", value="PREV"))
+
+                choices.extend([
+                    questionary.Choice(title="[ ⌨ 手动输入 ID ]", value="INPUT"),
+                    questionary.Choice(title="[ ✖ 退出程序 ]", value="EXIT")
+                ])
+
+                console.print(f"\n[bold green]已选任务:[/bold green] [yellow]{len(selected_tasks)}[/yellow] 期 | [dim]方向键移动，空格勾选，回车直接开始下载[/dim]")
+                try:
+                    results = await questionary.checkbox(
+                        f"请勾选期刊 (第 {offset//page_size + 1} 页):",
+                        choices=choices,
+                        style=questionary.Style([
+                            ('checkbox', 'fg:#00ffff'),
+                            ('selected', 'fg:#00ff00'),
+                            ('separator', 'fg:#666666'),
+                        ])
+                    ).ask_async()
+                except KeyboardInterrupt:
+                    break
+
+                if results is None or "EXIT" in results: 
+                    selected_tasks = [] # 清空以示退出
+                    break
+
+                # 优先级 1：处理导航指令 (如果有导航，则不触发立即下载)
+                nav_triggered = False
+
+                if "NEXT" in results:
+                    # 翻页前保存当前页的所有勾选状态
+                    for r in results:
+                        if isinstance(r, dict) and r["id"] not in [t[0] for t in selected_tasks]:
+                            selected_tasks.append((r["id"], r["url"], r))
+                    # 移除未勾选但之前在 selected_tasks 里的本页项目
+                    current_page_ids = [p["id"] for p in current_page_items]
+                    selected_tasks = [t for t in selected_tasks if not (t[0] in current_page_ids and t[0] not in [r["id"] for r in results if isinstance(r, dict)])]
+                    offset += page_size
+                    nav_triggered = True
+
+                elif "PREV" in results:
+                    for r in results:
+                        if isinstance(r, dict) and r["id"] not in [t[0] for t in selected_tasks]:
+                            selected_tasks.append((r["id"], r["url"], r))
+                    current_page_ids = [p["id"] for p in current_page_items]
+                    selected_tasks = [t for t in selected_tasks if not (t[0] in current_page_ids and t[0] not in [r["id"] for r in results if isinstance(r, dict)])]
+                    offset = max(0, offset - page_size)
+                    nav_triggered = True
+
+                elif "MORE" in results:
+                    with console.status("[bold green]从服务器获取更多历史期刊..."):
+                        try:
+                            await page.click(".xsjMore, a.more"); await asyncio.sleep(2)
+                            home_info = await get_toc(page)
+                            offset += page_size
+                        except Exception: 
+                            console.print("[yellow]⚠️ 已到达最末页。[/yellow]")
+                    nav_triggered = True
+
+                elif "INPUT" in results:
+                    manual_id = await questionary.text("请输入期号 (如 cw1180):").ask_async()
+                    if manual_id and manual_id.strip().startswith("cw"):
+                        mid = manual_id.strip()
+                        selected_tasks.append((mid, f"https://weekly.caixin.com/{datetime.now().year}/{mid}/", None))
+                    nav_triggered = True
+
+                # 优先级 2：如果没有触发导航，且结果不为空，则意味着用户按下回车确认当前选择
+                if not nav_triggered:
+                    # 更新最终选择
+                    final_batch = []
+                    # 先保留不在当前页的其他页选择
+                    current_page_ids = [p["id"] for p in current_page_items]
+                    final_batch = [t for t in selected_tasks if t[0] not in current_page_ids]
+                    # 加上当前页的勾选
+                    for r in results:
+                        if isinstance(r, dict):
+                            final_batch.append((r["id"], r["url"], r))
+
+                    selected_tasks = final_batch
+                    if selected_tasks:
+                        break # 跳出循环，开始下载
+                    else:
+                        console.print("[yellow]⚠️ 请至少勾选一期周刊。[/yellow]")
+
+            # --- 批量执行下载 ---
+
+            # --- 批量执行下载 ---
+            if selected_tasks:
+                # 按照期号排序，方便用户检查
+                selected_tasks.sort(key=lambda x: x[0])
+                
+                # 展示确认清单
+                table = Table(title="待下载任务清单", border_style="cyan", show_header=True, header_style="bold magenta")
+                table.add_column("期号", style="yellow")
+                table.add_column("出版日期", style="green")
+                table.add_column("刊名")
+                
+                for sid, surl, spast in selected_tasks:
+                    if spast:
+                        table.add_row(sid, spast["date"], spast["title"])
+                    else:
+                        table.add_row(sid, "手动输入", "未知")
+                
+                console.print("\n")
+                console.print(table)
+                
+                confirm_download = await questionary.confirm(
+                    f"确认开始下载以上 {len(selected_tasks)} 期杂志吗？",
+                    default=True
+                ).ask_async()
+                
+                if confirm_download:
+                    console.print(f"\n[bold blue]📦 正在开始批量任务...[/bold blue]")
+                    for sid, surl, spast in selected_tasks:
+                        await process_one_issue(sid, surl, spast, home_info, context)
+                    
+                    duration = time.time() - start_time
+                    console.print(Panel(f"[bold green]✨ 批量下载任务全部完成！[/bold green]\n[dim]总耗时: {duration:.1f} 秒[/dim]", border_style="green"))
+                else:
+                    console.print("[yellow]已取消下载，您可以重新选择。[/yellow]")
+                    # 重新进入循环（这里简单处理，退出即可，用户可以再次运行）
+            else:
+                console.print("[dim]👋 未选择任何任务，程序退出。[/dim]")
+        except Exception as e:
+            console.print(f"[bold red]💥 运行时发生未知错误:[/bold red] {e}")
+        finally:
+            await browser.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
