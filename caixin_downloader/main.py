@@ -214,22 +214,45 @@ async def get_toc(page, issue_url=None):
     html = await page.content()
     soup = BeautifulSoup(html, "html.parser")
     cover_url = None
-    issue_id = "Latest"
+    issue_id = None
+    
+    # 1. 尝试提取封面和当前期 ID
     for s in [".mi img", ".fm img", ".mains img", ".leftCon img", ".cover img"]:
         tag = soup.select_one(s)
         if tag and tag.get("src"): cover_url = tag.get("src"); break
+    
     mi_div = soup.select_one(".mi, .fm, .mains")
     if mi_div and mi_div.find("a", href=True):
         m = re.search(r"cw(\d+)", mi_div.find("a")["href"])
         if m: issue_id = m.group(0)
-    issue_no, issue_title = "XX", f"《财新周刊》 {issue_id}"
-    text_m = soup.find(string=re.compile(r"202\d年第\d+期"))
-    if text_m:
-        raw = text_m.strip().replace("{{", "").replace("}}", "")
-        cm = re.search(r"(《财新周刊》\s*\d{4}年第\d+期)", raw)
-        issue_title = cm.group(1) if cm else raw.split("出版日期")[0].strip()
-        nm = re.search(r"第(\d+)期", issue_title)
+    
+    # 2. 提取当前期标题和期号
+    issue_no, issue_title = "XX", "《财新周刊》"
+    issue_date = datetime.now().strftime("%Y年%m月%d日")
+    
+    # 尝试寻找包含期数的文本节点
+    for text_node in soup.find_all(string=re.compile(r"202\d年第\d+期")):
+        raw = text_node.strip().replace("{{", "").replace("}}", "")
+        # 提取标题：优先找含“财新周刊”的长字符串
+        cm = re.search(r"(《?财新周刊》?\s*\d{4}年第\d+期)", raw)
+        if cm:
+            issue_title = cm.group(1)
+        elif "第" in raw and "期" in raw:
+            # 如果没找到带书名的，直接用包含期数的这一行
+            issue_title = raw.split("出版日期")[0].strip()
+        
+        # 提取期号
+        nm = re.search(r"第(\d+)期", raw)
         if nm: issue_no = nm.group(1)
+        
+        # 提取日期
+        dm = re.search(r"(\d{4}年\d{2}月\d{2}日)", raw)
+        if dm: issue_date = dm.group(1)
+        
+        # 如果已经成功拿到期号，就不用再找了
+        if issue_no != "XX": break
+
+    # 3. 提取历史期刊列表
     past_issues = []
     for li in soup.select(".xsjCon li"):
         text = li.get_text(separator=" ", strip=True).replace("{{", "").replace("}}", "")
@@ -237,7 +260,76 @@ async def get_toc(page, issue_url=None):
         p = [p.strip() for p in text.split(" ") if p.strip()]
         a = li.find("a", href=True)
         cwm = re.search(r"cw\d+", a["href"]) if a else None
-        if cwm: past_issues.append({"id": cwm.group(0), "date": dm.group(1) if dm else "", "no": nm.group(1) if nm else "", "title": p[0] if p else "", "url": a["href"]})
+        if cwm: 
+            past_issues.append({
+                "id": cwm.group(0), 
+                "date": dm.group(1) if dm else "", 
+                "no": nm.group(1) if nm else "", 
+                "title": p[0] if p else "", 
+                "url": a["href"]
+            })
+    
+    # 4. 关键修复：如果当前期 ID 不在历史列表中，则将其置顶
+    if issue_id and not any(p["id"] == issue_id for p in past_issues):
+        current_year = datetime.now().year
+        target_url = f"https://weekly.caixin.com/{current_year}/{issue_id}/"
+        
+        # 如果当前在首页（issue_url 为空或为 weekly.caixin.com），且没拿到准确期号，去该期页面“偷”一下准确信息
+        is_home = not issue_url or "weekly.caixin.com/" in issue_url and issue_url.endswith("/")
+        if is_home and (issue_no == "XX" or "《财新周刊》" == issue_title):
+            try:
+                temp_page = await page.context.new_page()
+                await temp_page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                temp_html = await temp_page.content()
+                temp_soup = BeautifulSoup(temp_html, "html.parser")
+                
+                # 增强版搜索逻辑
+                found_no = False
+                current_year_str = str(datetime.now().year)
+                
+                # 1. 提取期号
+                no_candidates = []
+                for node in temp_soup.find_all(string=True):
+                    t = node.strip()
+                    if "第" in t and "期" in t and len(t) < 100:
+                        nm = re.search(r"第(\d+)期", t)
+                        if nm:
+                            num = nm.group(1)
+                            if len(num) <= 3: # 过滤掉总期号
+                                no_candidates.append((t, num))
+                
+                if no_candidates:
+                    # 优先选带年份的
+                    no_candidates.sort(key=lambda x: (current_year_str not in x[0], len(x[0])))
+                    issue_no = no_candidates[0][1]
+                    issue_title = f"《财新周刊》 {current_year_str}年第{issue_no}期"
+                    found_no = True
+
+                # 2. 提取日期 (独立搜索全页面)
+                for node in temp_soup.find_all(string=True):
+                    t = node.strip()
+                    dm = re.search(r"(\d{4})[年-](\d{1,2})[月-](\d{1,2})", t)
+                    if dm:
+                        issue_date = f"{dm.group(1)}年{int(dm.group(2)):02d}月{int(dm.group(3)):02d}日"
+                        if "出版日期" in t: break # 优先用带“出版日期”字样的
+                
+                await temp_page.close()
+            except Exception as e:
+                console.log(f"[dim]获取新刊详情失败: {e}[/dim]")
+
+        display_title = issue_title
+        if "第" not in display_title and issue_no != "XX": 
+            display_title += f" 第{issue_no}期"
+        
+        past_issues.insert(0, {
+            "id": issue_id,
+            "date": issue_date,
+            "no": issue_no,
+            "title": display_title,
+            "url": target_url
+        })
+
+    # 5. 提取正文文章链接
     links = []
     seen = set()
     containers = [t for t in [soup.select_one(".lf"), soup.select_one(".ri"), soup.select_one(".mi")] if t] or [soup]
@@ -248,7 +340,14 @@ async def get_toc(page, issue_url=None):
                 if h not in seen:
                     seen.add(h); t = re.sub(r'\s+', ' ', a.get_text(strip=True)).replace("{{", "").replace("}}", "")
                     if len(t) > 2 and "期号" not in t: links.append({"title": t, "url": h})
-    return {"issue_title": issue_title, "issue_no": issue_no, "cover_url": cover_url, "links": links, "past_issues": past_issues}
+    
+    return {
+        "issue_title": issue_title, 
+        "issue_no": issue_no, 
+        "cover_url": cover_url, 
+        "links": links, 
+        "past_issues": past_issues
+    }
 
 def create_epub(articles, info, image_manager, filename):
     book = epub.EpubBook()
