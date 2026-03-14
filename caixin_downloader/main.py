@@ -329,6 +329,7 @@ async def get_toc(page, issue_url=None):
             "url": target_url
         })
 
+
     # 5. 提取正文文章链接
     links = []
     seen = set()
@@ -340,13 +341,25 @@ async def get_toc(page, issue_url=None):
                 if h not in seen:
                     seen.add(h); t = re.sub(r'\s+', ' ', a.get_text(strip=True)).replace("{{", "").replace("}}", "")
                     if len(t) > 2 and "期号" not in t: links.append({"title": t, "url": h})
-    
+
+    # 6. 提取当期封面主题 (取第一篇文章标题作为主题)
+    topic = links[0]["title"] if links else ""
+    topic = re.sub(r"^封面报道[｜|：:]\s*", "", topic)
+
+    # 如果当前期的 title 是泛化的刊名，替换为封面主题
+    if topic and past_issues:
+        for pi in past_issues:
+            if pi.get("id") == issue_id and pi.get("title", "").startswith("《财新周刊》"):
+                pi["title"] = topic
+                break
+
     return {
-        "issue_title": issue_title, 
-        "issue_no": issue_no, 
-        "cover_url": cover_url, 
-        "links": links, 
-        "past_issues": past_issues
+        "issue_title": issue_title,
+        "issue_no": issue_no,
+        "cover_url": cover_url,
+        "links": links,
+        "past_issues": past_issues,
+        "topic": topic
     }
 
 def create_epub(articles, info, image_manager, filename):
@@ -433,7 +446,7 @@ async def process_one_issue(issue_id, issue_url, selected_past, home_info, conte
                 except Exception: continue
 
         if not selected_past:
-            selected_past = {"date": datetime.now().strftime("%Y年%m月%d日"), "no": info["issue_no"], "title": info["issue_title"]}
+            selected_past = {"date": datetime.now().strftime("%Y年%m月%d日"), "no": info["issue_no"], "title": info.get("topic") or info["issue_title"]}
 
         cover_url = info.get("cover_url") or home_info["cover_url"]
         if cover_url:
@@ -545,7 +558,7 @@ async def main():
                     # 状态保持：如果之前已选，则默认勾选
                     is_checked = p["id"] in [t[0] for t in selected_tasks]
                     choices.append(questionary.Choice(
-                        title=f"{p['id']} | {p['date']} | 第{p['no']}期", 
+                        title=f"{p['id']} | {p['date']} | 第{p['no']}期 | {p['title']}",
                         value=p,
                         checked=is_checked
                     ))
@@ -653,7 +666,7 @@ async def main():
                 table = Table(title="待下载任务清单", border_style="cyan", show_header=True, header_style="bold magenta")
                 table.add_column("期号", style="yellow")
                 table.add_column("出版日期", style="green")
-                table.add_column("刊名")
+                table.add_column("主题")
                 
                 for sid, surl, spast in selected_tasks:
                     if spast:
