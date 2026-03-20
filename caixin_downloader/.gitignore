@@ -2,4 +2,10 @@
 cookies.json
 .venv/
 __pycache__/
-\n# bkit PDCA\ndocs/01-plan/\ndocs/02-design/\ndocs/03-analysis/\ndocs/04-report/\n.bkit/
+download/
+.DS_Store
+.gemini/
+.pdca-status.json
+.claude/
+.bkit/
+docs/
