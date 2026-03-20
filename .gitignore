@@ -1,11 +1,8 @@
-*.epub
-cookies.json
+.DS_Store
 .venv/
 __pycache__/
 download/
-.DS_Store
+cookies.json
+*.epub
 .gemini/
 .pdca-status.json
-.claude/
-.bkit/
-docs/
