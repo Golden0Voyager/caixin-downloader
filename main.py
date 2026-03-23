@@ -27,7 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 COOKIES_FILE = "cookies.json"
-VERSION = "2.3"
+VERSION = "2.4"
 
 console = Console()
 
@@ -345,7 +345,7 @@ async def get_toc(page, issue_url=None):
         target_url = f"https://weekly.caixin.com/{current_year}/{issue_id}/"
         
         # 如果当前在首页（issue_url 为空或为 weekly.caixin.com），且没拿到准确期号，去该期页面“偷”一下准确信息
-        is_home = not issue_url or "weekly.caixin.com/" in issue_url and issue_url.endswith("/")
+        is_home = (not issue_url) or ("weekly.caixin.com/" in issue_url and issue_url.endswith("/"))
         if is_home and (issue_no == "XX" or "《财新周刊》" == issue_title):
             try:
                 temp_page = await page.context.new_page()
@@ -354,7 +354,6 @@ async def get_toc(page, issue_url=None):
                 temp_soup = BeautifulSoup(temp_html, "html.parser")
                 
                 # 增强版搜索逻辑
-                found_no = False
                 current_year_str = str(datetime.now().year)
                 
                 # 1. 提取期号
@@ -373,7 +372,6 @@ async def get_toc(page, issue_url=None):
                     no_candidates.sort(key=lambda x: (current_year_str not in x[0], len(x[0])))
                     issue_no = no_candidates[0][1]
                     issue_title = f"《财新周刊》 {current_year_str}年第{issue_no}期"
-                    found_no = True
 
                 # 2. 提取日期 (独立搜索全页面)
                 for node in temp_soup.find_all(string=True):
@@ -443,7 +441,6 @@ def create_epub(articles, info, image_manager, filename):
     body { font-family: "STSong", "Songti SC", "PingFang SC", serif; line-height: 1.85; padding: 0 2%; color: #1a1a1a; text-align: justify; }
     .toc-container { padding: 8% 5%; }
     .toc-header { font-size: 2.2em; border-bottom: 4px solid #000; padding-bottom: 12px; margin-bottom: 40px; font-weight: bold; }
-    .toc-cover { width: 100%; max-width: 280px; margin-bottom: 30px; box-shadow: 0 8px 15px rgba(0,0,0,0.1); }
     .toc-list { list-style: none; padding: 0; }
     .toc-item { margin: 18px 0; border-bottom: 1px solid #f0f0f0; padding-bottom: 10px; display: block; text-decoration: none; color: #222; }
     .article-header { margin: 3em 0 4em 0; text-align: center; }
@@ -680,23 +677,22 @@ async def main():
                 # 优先级 1：处理导航指令 (如果有导航，则不触发立即下载)
                 nav_triggered = False
 
-                if "NEXT" in results:
-                    # 翻页前保存当前页的所有勾选状态
+                def _sync_page_selections(results, selected_tasks, current_page_items):
+                    """翻页时同步当前页的勾选状态到 selected_tasks"""
                     for r in results:
                         if isinstance(r, dict) and r["id"] not in [t[0] for t in selected_tasks]:
                             selected_tasks.append((r["id"], r["url"], r))
-                    # 移除未勾选但之前在 selected_tasks 里的本页项目
                     current_page_ids = [p["id"] for p in current_page_items]
-                    selected_tasks = [t for t in selected_tasks if not (t[0] in current_page_ids and t[0] not in [r["id"] for r in results if isinstance(r, dict)])]
+                    selected_ids = {r["id"] for r in results if isinstance(r, dict)}
+                    return [t for t in selected_tasks if t[0] not in current_page_ids or t[0] in selected_ids]
+
+                if "NEXT" in results:
+                    selected_tasks = _sync_page_selections(results, selected_tasks, current_page_items)
                     offset += page_size
                     nav_triggered = True
 
                 elif "PREV" in results:
-                    for r in results:
-                        if isinstance(r, dict) and r["id"] not in [t[0] for t in selected_tasks]:
-                            selected_tasks.append((r["id"], r["url"], r))
-                    current_page_ids = [p["id"] for p in current_page_items]
-                    selected_tasks = [t for t in selected_tasks if not (t[0] in current_page_ids and t[0] not in [r["id"] for r in results if isinstance(r, dict)])]
+                    selected_tasks = _sync_page_selections(results, selected_tasks, current_page_items)
                     offset = max(0, offset - page_size)
                     nav_triggered = True
 
@@ -719,9 +715,6 @@ async def main():
 
                 # 优先级 2：如果没有触发导航，且结果不为空，则意味着用户按下回车确认当前选择
                 if not nav_triggered:
-                    # 更新最终选择
-                    final_batch = []
-                    # 先保留不在当前页的其他页选择
                     current_page_ids = [p["id"] for p in current_page_items]
                     final_batch = [t for t in selected_tasks if t[0] not in current_page_ids]
                     # 加上当前页的勾选
@@ -734,8 +727,6 @@ async def main():
                         break # 跳出循环，开始下载
                     else:
                         console.print("[yellow]⚠️ 请至少勾选一期周刊。[/yellow]")
-
-            # --- 批量执行下载 ---
 
             # --- 批量执行下载 ---
             if selected_tasks:
