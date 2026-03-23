@@ -27,7 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 COOKIES_FILE = "cookies.json"
-VERSION = "2.2"
+VERSION = "2.3"
 
 console = Console()
 
@@ -99,22 +99,47 @@ class ImageManager:
 async def scrape_article(page, url, image_manager, default_title=None):
     """抓取单篇文章的正文内容并处理图片"""
     try:
+        # 设置 API 响应拦截器，捕获付费墙 JS 请求的完整正文
+        api_content = {}
+
+        async def intercept_content(response):
+            if "checkAuthByIdJsonp" in response.url and "type=0" in response.url:
+                try:
+                    body = await response.text()
+                    api_json = json.loads(body)
+                    if api_json.get("code") == 0 and api_json.get("data"):
+                        data_str = api_json["data"]
+                        cm = re.search(r'resetContentInfo\((.+)\)$', data_str, re.DOTALL)
+                        if cm:
+                            inner = json.loads(cm.group(1))
+                            api_content["html"] = inner.get("content", "")
+                except Exception:
+                    pass
+
+        page.on("response", intercept_content)
         await safe_goto(page, url)
+
+        # 等待页面 JS 发起 API 请求并完成
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
         await page.wait_for_timeout(2000)
-        
-        # 针对付费内容的特殊等待（如果有的话）
+
+        page.remove_listener("response", intercept_content)
+
         html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
-        
+
         # 1. 标题提取
         title = "未知标题"
         title_tag = soup.select_one("h1, .wiv-title, .art-title, .title, #conTit h1")
-        if title_tag: 
+        if title_tag:
             title = title_tag.get_text(strip=True)
-        elif default_title: 
+        elif default_title:
             title = default_title
-        title = re.sub(r"\{\{.*?\}\}", "", title).strip() # 移除模板残留
-                
+        title = re.sub(r"\{\{.*?\}\}", "", title).strip()
+
         # 2. 作者提取
         author_info = ""
         author_selectors = [".author", ".artInfo", "#author_top", ".editor-name", ".media-name"]
@@ -124,10 +149,14 @@ async def scrape_article(page, url, image_manager, default_title=None):
                 author_info = tag.get_text(separator=" ", strip=True)
                 if "本文来源于" in author_info: author_info = ""
                 if author_info: break
-            
-        # 3. 正文提取
-        content_div = soup.find(id="Main_Content_Val") or soup.select_one(".text, .article-content, article, #main_content, .art-content")
-        if not content_div: return None
+
+        # 3. 正文提取 — 优先使用拦截到的 API 全文
+        if api_content.get("html"):
+            content_div = BeautifulSoup(f"<div>{api_content['html']}</div>", "html.parser").div
+        else:
+            # 回退：从页面 DOM 提取
+            content_div = soup.find(id="Main_Content_Val") or soup.select_one(".text, .article-content, article, #main_content, .art-content")
+            if not content_div: return None
 
         # 4. 清理无效元素
         blacklist = [
@@ -150,41 +179,79 @@ async def scrape_article(page, url, image_manager, default_title=None):
             if not text and not tag.find_all() and tag.name not in ["img", "br", "hr"]:
                 tag.decompose(); continue
 
-        # 6. 图片处理 (支持懒加载)
+        # 6. 图片处理 (支持 CXIMG 自定义标签 + 懒加载)
         img_tags = content_div.find_all("img")
         img_urls = []
+        img_captions = []
+        img_containers = []  # 需要清理的原始容器
+
         for img in img_tags:
-            # 候选属性列表
             src = img.get("data-src") or img.get("data-original-src") or img.get("src")
             img_urls.append(src)
-            
+
+            cap_text = ""
+            container = None
+
+            # 策略1: CXIMG / article_img_container 结构
+            cximg = img.find_parent("cximg") or img.find_parent(attrs={"class": "article_img_container"})
+            if cximg:
+                container = cximg
+                talk = cximg.find(attrs={"class": "article_img_talk"})
+                if talk:
+                    cap_text = talk.get_text(strip=True)
+
+            # 策略2: DL/DD 结构
+            if not cap_text:
+                dl = img.find_parent("dl")
+                if dl:
+                    container = container or dl
+                    dd = dl.find("dd")
+                    if dd:
+                        cap_text = dd.get_text(strip=True)
+
+            # 策略3: 兄弟节点（从 img 或其最近的块级父容器开始向后搜索）
+            if not cap_text:
+                search_base = img.parent if img.parent and img.parent.name in ["a", "div", "p"] else img
+                nxt = search_base.find_next_sibling()
+                caption_classes = [
+                    "imageText", "caption", "artInfo", "pic_content", "source",
+                    "img-caption", "pic_info", "article_img_talk"
+                ]
+                for _ in range(3):
+                    if nxt and nxt.name in ["p", "div", "span", "figcaption"]:
+                        n_cls = nxt.get("class", [])
+                        if isinstance(n_cls, str): n_cls = [n_cls]
+                        if any(c in n_cls for c in caption_classes) or nxt.get("id") == "pic_info":
+                            cap_text = nxt.get_text(strip=True)
+                            if not container: nxt.decompose()
+                            break
+                    if nxt: nxt = nxt.find_next_sibling()
+
+            img_captions.append(cap_text)
+            img_containers.append(container)
+
         if img_urls:
             local_paths = await asyncio.gather(*[image_manager.download(u) for u in img_urls])
             for idx, img in enumerate(img_tags):
                 path = local_paths[idx]
                 if path:
+                    # 构建干净的 figure 结构
                     figure = soup.new_tag("figure", attrs={"class": "article-figure"})
-                    img.attrs = {"src": path, "class": "article-img"}
-                    
-                    # 提取图注
-                    cap_text = ""
-                    # 尝试寻找兄弟节点的图注
-                    nxt = img.find_next_sibling()
-                    for _ in range(2):
-                        if nxt and nxt.name in ["p", "div", "span"]:
-                            n_cls = nxt.get("class", [])
-                            if isinstance(n_cls, str): n_cls = [n_cls]
-                            caption_classes = ["imageText", "caption", "artInfo", "pic_content", "source", "img-caption", "pic_info"]
-                            if any(c in n_cls for c in caption_classes) or nxt.get("id") == "pic_info":
-                                cap_text = nxt.get_text(strip=True); nxt.decompose(); break
-                        if nxt: nxt = nxt.find_next_sibling()
-                    
-                    img.wrap(figure)
-                    if cap_text:
+                    new_img = soup.new_tag("img", attrs={"src": path, "class": "article-img"})
+                    figure.append(new_img)
+
+                    if img_captions[idx]:
                         fcap = soup.new_tag("figcaption", attrs={"class": "article-caption"})
-                        fcap.string = cap_text; figure.append(fcap)
+                        fcap.string = img_captions[idx]
+                        figure.append(fcap)
+
+                    # 替换：如果有容器则替换容器，否则替换 img 本身
+                    target = img_containers[idx] if img_containers[idx] else img
+                    target.replace_with(figure)
                 else:
-                    img.decompose()
+                    # 下载失败：删除容器或 img
+                    target = img_containers[idx] if img_containers[idx] else img
+                    target.decompose()
 
         # 7. 属性清洗 (移除所有 ID 和不必要的 Class)
         preserved_classes = {"lead", "quote", "author-bar", "content-body", "article-figure", "article-img", "article-caption"}
@@ -378,12 +445,14 @@ def create_epub(articles, info, image_manager, filename):
     .toc-item { margin: 18px 0; border-bottom: 1px solid #f0f0f0; padding-bottom: 10px; display: block; text-decoration: none; color: #222; }
     .article-header { margin: 3em 0 4em 0; text-align: center; }
     .article-title { font-size: 2.2em; font-weight: bold; line-height: 1.2; margin-bottom: 0.8em; }
+    .author-bar { font-size: 0.85em; color: #888; text-align: center; margin-top: 0.5em; }
     .content-body { font-size: 1.1em; }
     .content-body p { margin: 1.6em 0; text-indent: 2em; }
-    .content-body p:first-of-type { text-indent: 0; font-weight: bold; }
-    .article-figure { margin: 3.5em 0; text-align: center; }
-    .article-img { width: 100% !important; height: auto; display: block; margin: 0 auto; }
-    .article-caption { font-size: 0.82em; color: #666; font-style: italic; text-align: center; margin-top: 0.8em; padding: 0 8%; }
+    .content-body p:first-of-type { text-indent: 0; }
+    .article-figure { margin: 2.5em 0; padding: 0; text-align: center; page-break-inside: avoid; width: 100%; }
+    .article-img { width: 100% !important; max-width: 100% !important; height: auto !important; display: block; margin: 0; padding: 0; }
+    .article-caption { font-family: "PingFang SC", "Helvetica Neue", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; font-size: 0.55em; color: #999; text-align: center; margin-top: 0.6em; padding: 0; text-indent: 0; line-height: 1.4; }
+    .article-footer { margin-top: 4em; text-align: center; }
     .back-to-toc { display: inline-block; padding: 12px 30px; border: 1.5px solid #222; text-decoration: none; color: #222; font-weight: bold; border-radius: 30px; }
     '''
     book.add_item(epub.EpubItem(uid="style_default", file_name="style/default.css", media_type="text/css", content=style))
