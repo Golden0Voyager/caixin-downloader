@@ -241,7 +241,8 @@ async def scrape_article(page, url, image_manager, default_title=None):
                     figure.append(new_img)
 
                     if img_captions[idx]:
-                        fcap = soup.new_tag("figcaption", attrs={"class": "article-caption"})
+                        caption_style = "font-family: 'PingFang SC', 'Helvetica Neue', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; font-size: 12px; color: #999; text-align: center; margin-top: 0.6em; padding: 0; text-indent: 0; line-height: 1.4;"
+                        fcap = soup.new_tag("figcaption", attrs={"class": "article-caption", "style": caption_style})
                         fcap.string = img_captions[idx]
                         figure.append(fcap)
 
@@ -253,15 +254,17 @@ async def scrape_article(page, url, image_manager, default_title=None):
                     target = img_containers[idx] if img_containers[idx] else img
                     target.decompose()
 
-        # 7. 属性清洗 (移除所有 ID 和不必要的 Class)
+        # 7. 属性清洗 (移除所有 ID 和不必要的 Class，保留内联 style)
         preserved_classes = {"lead", "quote", "author-bar", "content-body", "article-figure", "article-img", "article-caption"}
         for tag in content_div.find_all(True):
             if tag.name == "img": continue
             c_cls = tag.get("class", [])
             if isinstance(c_cls, str): c_cls = [c_cls]
+            inline_style = tag.get("style")
             n_attrs = {}
             valid_classes = [c for c in c_cls if c in preserved_classes]
             if valid_classes: n_attrs["class"] = " ".join(valid_classes)
+            if inline_style: n_attrs["style"] = inline_style
             tag.attrs = n_attrs
 
         # 8. 组装 HTML
@@ -451,7 +454,7 @@ def create_epub(articles, info, image_manager, filename):
     .content-body p:first-of-type { text-indent: 0; }
     .article-figure { margin: 2.5em 0; padding: 0; text-align: center; page-break-inside: avoid; width: 100%; }
     .article-img { width: 100% !important; max-width: 100% !important; height: auto !important; display: block; margin: 0; padding: 0; }
-    .article-caption { font-family: "PingFang SC", "Helvetica Neue", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; font-size: 0.55em; color: #999; text-align: center; margin-top: 0.6em; padding: 0; text-indent: 0; line-height: 1.4; }
+    figcaption.article-caption { font-family: "PingFang SC", "Helvetica Neue", "Hiragino Sans GB", "Microsoft YaHei", sans-serif !important; font-size: 12px !important; color: #999 !important; text-align: center; margin-top: 0.6em; padding: 0; text-indent: 0 !important; line-height: 1.4; }
     .article-footer { margin-top: 4em; text-align: center; }
     .back-to-toc { display: inline-block; padding: 12px 30px; border: 1.5px solid #222; text-decoration: none; color: #222; font-weight: bold; border-radius: 30px; }
     '''
@@ -460,25 +463,27 @@ def create_epub(articles, info, image_manager, filename):
     for url, data in image_manager.images.items():
         book.add_item(epub.EpubItem(uid=data["id"], file_name=data["filename"], media_type=data["mime"], content=data["content"]))
 
-    if info.get("cover_data"): 
+    if info.get("cover_data"):
         book.set_cover("images/cover.jpg", info["cover_data"])
 
-    # 1. 创建自定义目录页 (CONTENTS)
+    # 1. 创建独立封面页
+    cover_page = None
+    if info.get("cover_data"):
+        cover_html = '<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body><div style="text-align:center; padding:0; margin:0;"><img src="images/cover.jpg" style="width:100%; max-width:100%; height:auto;" /></div></body></html>'
+        cover_page = epub.EpubHtml(uid="cover_page", title="封面", file_name="cover_page.xhtml", content=cover_html, lang='zh-CN')
+        book.add_item(cover_page)
+
+    # 2. 创建自定义目录页 (CONTENTS)
     clean_it = info["issue_title"].replace("《", "").replace("》", "")
     toc_html = f'<div class="toc-container"><div class="toc-header">《{clean_it}》 · 目录</div>'
-    if info.get("cover_data"): toc_html += '<img src="images/cover.jpg" class="toc-cover" />'
     toc_html += '<div class="toc-list">'
     for i, art in enumerate(articles):
         clean_t = art["title"].replace("{{", "").replace("}}", "").strip()
         toc_html += f'<a class="toc-item" href="chapter_{i}.xhtml"><div class="toc-item-title">{i+1}. {clean_t}</div></a>'
     toc_html += '</div></div>'
-    
+
     cp = epub.EpubHtml(uid="contents", title="目录", file_name="contents.xhtml", content=f'<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body>{toc_html}</body></html>', lang='zh-CN')
     book.add_item(cp)
-    
-    # 2. 创建空白页
-    bp = epub.EpubHtml(uid="blank", title=" ", file_name="blank.xhtml", content='<html><body><div style="height:100vh;"></div></body></html>', lang='zh-CN')
-    book.add_item(bp)
 
     # 3. 生成文章章节
     spine_chapters = []
@@ -486,12 +491,18 @@ def create_epub(articles, info, image_manager, filename):
         ch = epub.EpubHtml(uid=f"chapter_{i}", title=art["title"], file_name=f"chapter_{i}.xhtml", content=f'<html><head><link href="style/default.css" rel="stylesheet" type="text/css"/></head><body>{art["html"]}</body></html>', lang='zh-CN')
         book.add_item(ch)
         spine_chapters.append(ch)
-        
+
     # 4. 设置系统导航和阅读顺序
     book.toc = tuple(spine_chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ['nav', cp, bp] + spine_chapters
+    # spine: 封面 → 目录 → 正文章节 → nav（隐藏在末尾）
+    spine = []
+    if cover_page: spine.append(cover_page)
+    spine.append(cp)
+    spine.extend(spine_chapters)
+    spine.append('nav')
+    book.spine = spine
     
     epub.write_epub(filename, book, {})
     console.print(Panel(f"[bold green]✅ 成功保存至:[/bold green] [cyan]{Path(filename).absolute()}[/cyan]", border_style="green"))
