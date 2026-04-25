@@ -2,10 +2,6 @@
 
 财新内容下载与本地化存储工具。
 
-## 🚀 运行环境 (Runtime)
-- **环境管理**: `uv` (强制)
-- **核心技术**: Python, Playwright/Requests
-
 ## 🧠 AI 协作规范 (AI Patterns)
 - **协作模式**: 专注于 HTML/JS 内容解析与 PDF/Markdown 格式转换逻辑。
 
