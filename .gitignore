@@ -5,4 +5,5 @@ download/
 cookies.json
 *.epub
 .gemini/
+.agents/
 .pdca-status.json
