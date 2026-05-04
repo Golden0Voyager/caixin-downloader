@@ -99,35 +99,67 @@ class ImageManager:
 async def scrape_article(page, url, image_manager, default_title=None):
     """抓取单篇文章的正文内容并处理图片"""
     try:
-        # 设置 API 响应拦截器，捕获付费墙 JS 请求的完整正文
-        api_content = {}
+        # 使用 page.on 捕获所有 API 响应，可能有多页
+        api_parts = []
+        api_auth_failed = False
 
         async def intercept_content(response):
             if "checkAuthByIdJsonp" in response.url and "type=0" in response.url:
                 try:
                     body = await response.text()
-                    api_json = json.loads(body)
-                    if api_json.get("code") == 0 and api_json.get("data"):
-                        data_str = api_json["data"]
-                        cm = re.search(r'resetContentInfo\((.+)\)$', data_str, re.DOTALL)
-                        if cm:
-                            inner = json.loads(cm.group(1))
-                            api_content["html"] = inner.get("content", "")
+                    api_json = None
+                    try:
+                        api_json = json.loads(body)
+                    except json.JSONDecodeError:
+                        m = re.search(r'[^(]+\((.+)\)\s*$', body, re.DOTALL)
+                        if m:
+                            api_json = json.loads(m.group(1))
+
+                    if api_json:
+                        if api_json.get("code") == 0 and api_json.get("data"):
+                            data_str = api_json["data"]
+                            cm = re.search(r'resetContentInfo\((.+)\)$', data_str, re.DOTALL)
+                            if cm:
+                                inner = json.loads(cm.group(1))
+                                part = inner.get("content", "")
+                                if part:
+                                    api_parts.append(part)
+                        elif api_json.get("code") != 0:
+                            api_auth_failed = True
                 except Exception:
                     pass
 
-        page.on("response", intercept_content)
+        _handler = lambda r: asyncio.create_task(intercept_content(r))
+        page.on("response", _handler)
+
         await safe_goto(page, url)
 
-        # 等待页面 JS 发起 API 请求并完成
+        # 关键：等待 networkidle，让 JS 有足够时间加载完整内容
         try:
             await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
-        page.remove_listener("response", intercept_content)
+        # 点击"余下全文"加载后续分页（财新周刊文章多页结构）
+        try:
+            remain_link = page.locator("a[href*='#page2']", has_text="余下全文")
+            if await remain_link.count() > 0:
+                await remain_link.click()
+                await page.wait_for_timeout(5000)
+        except Exception:
+            pass
 
+        try:
+            page.remove_listener("response", _handler)
+        except Exception:
+            pass
+
+        # 合并所有 API 分页内容
+        api_html = "".join(api_parts)
+        api_content = {"html": api_html} if api_html else {}
+
+        # 无论 API 是否成功，都获取最终 DOM 作为比对基准
         html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
 
@@ -150,31 +182,70 @@ async def scrape_article(page, url, image_manager, default_title=None):
                 if "本文来源于" in author_info: author_info = ""
                 if author_info: break
 
-        # 3. 正文提取 — 优先使用拦截到的 API 全文
+        # 3. 正文提取 — 对比 API 和 DOM，取更完整的内容
+        dom_div = soup.find(id="Main_Content_Val") or soup.select_one(".text, .article-content, article, #main_content, .art-content")
+        api_div = None
         if api_content.get("html"):
-            content_div = BeautifulSoup(f"<div>{api_content['html']}</div>", "html.parser").div
+            api_div = BeautifulSoup(f"<div>{api_content['html']}</div>", "html.parser").div
+
+        # 选择更长的内容，确保拿到完整正文
+        if api_div and dom_div:
+            api_len = len(api_div.get_text(strip=True))
+            dom_len = len(dom_div.get_text(strip=True))
+            content_div = api_div if api_len >= dom_len else dom_div
+            if api_len > 0 and dom_len > 0 and abs(api_len - dom_len) > max(api_len, dom_len) * 0.3:
+                console.log(f"[dim]文章正文来源: API={api_len}字 vs DOM={dom_len}字，选择{'API' if api_len >= dom_len else 'DOM'}[/dim]")
+        elif api_div:
+            content_div = api_div
+        elif dom_div:
+            content_div = dom_div
         else:
-            # 回退：从页面 DOM 提取
-            content_div = soup.find(id="Main_Content_Val") or soup.select_one(".text, .article-content, article, #main_content, .art-content")
-            if not content_div: return None
+            return None
 
         # 4. 清理无效元素
         blacklist = [
-            "script", "style", "canvas", ".share", ".ad", ".bottom-adv", 
-            ".media-box", ".aitt", ".copyright", ".watermark", ".mask", 
-            ".hide", ".hidden", ".artInfo-box", ".read-all", ".pay-all", 
+            "script", "style", "canvas", ".share", ".ad", ".bottom-adv",
+            ".media-box", ".aitt", ".copyright", ".watermark", ".mask",
+            ".hide", ".hidden", ".artInfo-box", ".read-all", ".pay-all",
             ".copyright-box", ".related-articles", ".recommend", ".keyword"
         ]
         for selector in blacklist:
             for tag in content_div.select(selector): tag.decompose()
-            
-        # 5. 水印与垃圾文本清理
+
+        # 5. 正文边界截断：财新文章末尾有"财"小蓝标，其后是相关推荐/视频，不应入 EPUB
+        def _truncate_after_end_marker(root):
+            """找到文章结尾标志后截断，返回是否成功截断"""
+            # 策略1：关键词截断（在块级标签中搜索，避免内联标签误触发）
+            trunc_kws = ["相关视频", "视频说明", "更多报道详见", "相关阅读", "延伸阅读", "热门文章", "推荐阅读", "对此文亦有贡献"]
+            for tag in root.find_all(["p", "div", "section", "h2", "h3", "h4", "figcaption"]):
+                text = tag.get_text(strip=True)
+                # 使用 in 而非 startswith，因为文本可能以空格或加粗标签开头
+                if any(kw in text for kw in trunc_kws):
+                    for sibling in list(tag.find_next_siblings()):
+                        sibling.decompose()
+                    tag.decompose()
+                    return True
+            # 策略2：财新结尾 logo（链接到首页的小图标）
+            for tag in root.find_all("a"):
+                href = tag.get("href", "")
+                # 精确匹配首页链接，且包含图片
+                if href in ("https://www.caixin.com/", "https://caixin.com/", "/", "https://www.caixin.com"):
+                    if tag.find("img"):
+                        for sibling in list(tag.find_next_siblings()):
+                            sibling.decompose()
+                        tag.decompose()
+                        return True
+            return False
+
+        _truncate_after_end_marker(content_div)
+
+        # 6. 水印与垃圾文本清理
         for tag in content_div.find_all(True):
             text = tag.get_text(strip=True)
             watermark_kws = ["财新网版权", "翻录必究", "财新版权", "翻版必究", "此材料受版权保护", "摘录来自", "本文为财新"]
             if (any(k in text for k in watermark_kws) and len(text) < 180) or re.match(r"^\d{10,}$", text):
                 tag.decompose(); continue
-            
+
             # 清理空的或只有空白字符的标签 (非自闭合标签)
             if not text and not tag.find_all() and tag.name not in ["img", "br", "hr"]:
                 tag.decompose(); continue
@@ -254,7 +325,7 @@ async def scrape_article(page, url, image_manager, default_title=None):
                     target = img_containers[idx] if img_containers[idx] else img
                     target.decompose()
 
-        # 7. 属性清洗 (移除所有 ID 和不必要的 Class，保留内联 style)
+        # 7. 属性清洗 (移除所有 ID 和不必要的 Class，保留内联 style 和关键属性)
         preserved_classes = {"lead", "quote", "author-bar", "content-body", "article-figure", "article-img", "article-caption"}
         for tag in content_div.find_all(True):
             if tag.name == "img": continue
@@ -265,6 +336,9 @@ async def scrape_article(page, url, image_manager, default_title=None):
             valid_classes = [c for c in c_cls if c in preserved_classes]
             if valid_classes: n_attrs["class"] = " ".join(valid_classes)
             if inline_style: n_attrs["style"] = inline_style
+            if tag.name == "a":
+                href = tag.get("href")
+                if href: n_attrs["href"] = href
             tag.attrs = n_attrs
 
         # 8. 组装 HTML
@@ -273,7 +347,17 @@ async def scrape_article(page, url, image_manager, default_title=None):
         article_html += f"</div><div class='content-body'>{str(content_div)}</div>"
         article_html = re.sub(r"\{\{.*?\}\}", "", article_html)
         article_html += "<div class='article-footer'><a href='contents.xhtml' class='back-to-toc'>回到目录 / Back to TOC</a></div>"
-        
+
+        # 完整性验证
+        content_text = content_div.get_text(strip=True)
+        if "余下全文" in content_text or "阅读全文需" in content_text or "订阅后继续阅读" in content_text:
+            console.log(f"[yellow]⚠️ 文章 ({title[:15]}) 可能不完整，正文包含未加载标志[/yellow]")
+        elif api_auth_failed and not api_content.get("html"):
+            console.log(f"[yellow]⚠️ Cookie 可能已失效，文章 ({title[:15]}) 仅抓到摘要[/yellow]")
+        else:
+            src = "API" if api_div and (not dom_div or len(api_div.get_text(strip=True)) >= len(dom_div.get_text(strip=True))) else "DOM"
+            console.log(f"[dim]✓ {title[:15]}... ({len(content_text)}字, 来源:{src})[/dim]")
+
         return {"title": title, "html": article_html, "url": url}
     except Exception as e:
         console.log(f"[dim]抓取异常 ({url}): {e}[/dim]")
@@ -401,7 +485,10 @@ async def get_toc(page, issue_url=None):
     # 5. 提取正文文章链接
     links = []
     seen = set()
-    containers = [t for t in [soup.select_one(".lf"), soup.select_one(".ri"), soup.select_one(".mi")] if t] or [soup]
+    containers = [t for t in [
+        soup.select_one(".lf"), soup.select_one(".ri"), soup.select_one(".mi"),
+        soup.select_one(".main"), soup.select_one(".content"), soup.select_one(".article-list")
+    ] if t] or [soup]
     for c in containers:
         for a in c.find_all("a", href=True):
             h = a["href"]
@@ -438,21 +525,30 @@ def create_epub(articles, info, image_manager, filename):
     book.add_author("财新周刊")
     
     style = '''
-    body { font-family: "STSong", "Songti SC", "PingFang SC", serif; line-height: 1.85; padding: 0 2%; color: #1a1a1a; text-align: justify; }
+    body { font-family: "STSong", "Songti SC", "PingFang SC", "Noto Serif CJK SC", serif; line-height: 1.85; padding: 0 2%; color: #1a1a1a; text-align: justify; }
     .toc-container { padding: 8% 5%; }
     .toc-header { font-size: 2.2em; border-bottom: 4px solid #000; padding-bottom: 12px; margin-bottom: 40px; font-weight: bold; }
     .toc-list { list-style: none; padding: 0; }
     .toc-item { margin: 18px 0; border-bottom: 1px solid #f0f0f0; padding-bottom: 10px; display: block; text-decoration: none; color: #222; }
-    .article-header { margin: 3em 0 4em 0; text-align: center; }
+    .article-header { margin: 3em 0 2em 0; text-align: center; }
     .article-title { font-size: 2.2em; font-weight: bold; line-height: 1.2; margin-bottom: 0.8em; }
-    .author-bar { font-size: 0.85em; color: #888; text-align: center; margin-top: 0.5em; }
+    .author-bar { font-size: 0.85em; color: #888; text-align: center; margin-top: 0.5em; margin-bottom: 2em; }
     .content-body { font-size: 1.1em; }
     .content-body p { margin: 1.6em 0; text-indent: 2em; }
     .content-body p:first-of-type { text-indent: 0; }
+    .content-body h2 { font-size: 1.5em; font-weight: bold; margin: 2.2em 0 1em 0; text-align: left; color: #1a1a1a; border-left: 4px solid #333; padding-left: 12px; line-height: 1.4; }
+    .content-body h3 { font-size: 1.25em; font-weight: bold; margin: 2em 0 0.8em 0; text-align: left; color: #333; line-height: 1.4; }
+    .content-body h4 { font-size: 1.1em; font-weight: bold; margin: 1.8em 0 0.6em 0; text-align: left; color: #444; }
+    .content-body blockquote { margin: 1.8em 0; padding: 1em 1.5em; background: #f8f8f8; border-left: 4px solid #ccc; color: #555; }
+    .content-body blockquote p { text-indent: 0; margin: 0.6em 0; }
+    .content-body strong, .content-body b { font-weight: bold; color: #000; }
+    .content-body a { color: #1a1a1a; text-decoration: underline; text-decoration-color: #999; }
+    .content-body ul, .content-body ol { margin: 1.2em 0; padding-left: 2em; }
+    .content-body li { margin: 0.5em 0; text-indent: 0; }
     .article-figure { margin: 2.5em 0; padding: 0; text-align: center; page-break-inside: avoid; width: 100%; }
     .article-img { width: 100% !important; max-width: 100% !important; height: auto !important; display: block; margin: 0; padding: 0; }
-    figcaption.article-caption { font-family: "PingFang SC", "Helvetica Neue", "Hiragino Sans GB", "Microsoft YaHei", sans-serif !important; font-size: 12px !important; color: #999 !important; text-align: center; margin-top: 0.6em; padding: 0; text-indent: 0 !important; line-height: 1.4; }
-    .article-footer { margin-top: 4em; text-align: center; }
+    figcaption.article-caption { font-family: "PingFang SC", "Helvetica Neue", "Hiragino Sans GB", "Microsoft YaHei", sans-serif !important; font-size: 12px !important; color: #999 !important; text-align: center !important; margin-top: 0.8em !important; padding: 0 !important; text-indent: 0 !important; line-height: 1.4; }
+    .article-footer { margin-top: 4em; text-align: center; padding-bottom: 3em; }
     .back-to-toc { display: inline-block; padding: 12px 30px; border: 1.5px solid #222; text-decoration: none; color: #222; font-weight: bold; border-radius: 30px; }
     '''
     book.add_item(epub.EpubItem(uid="style_default", file_name="style/default.css", media_type="text/css", content=style))
@@ -548,7 +644,7 @@ async def process_one_issue(issue_id, issue_url, selected_past, home_info, conte
             transient=True # 完成后自动清除进度条，保持界面干净
         ) as progress:
             task_id = progress.add_task(f"[cyan]🚀 正在下载《{selected_past['title']}》...", total=len(links))
-            semaphore, articles = asyncio.Semaphore(4), [None] * len(links)
+            semaphore, articles = asyncio.Semaphore(2), [None] * len(links)  # 降低并发，确保单页加载完整
 
             async def worker(i, item):
                 async with semaphore:
