@@ -7,3 +7,6 @@ cookies.json
 .gemini/
 .agents/
 .pdca-status.json
+# Skill-generated analysis artifacts
+.understand-anything/
+.codegraph/
