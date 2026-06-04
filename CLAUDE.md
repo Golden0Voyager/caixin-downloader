@@ -1,3 +1,10 @@
+## ⚠️ 环境约束（强制）
+
+- **包管理器**：`uv pip install <pkg>`（禁止 `pip` / `python -m pip`）
+- **运行脚本**：`uv run python <script>.py`（禁止直接 `python`）
+
+---
+
 # CLAUDE.md - Caixin Downloader
 
 This file provides guidance to Claude Code when working with this repository.
@@ -9,7 +16,6 @@ This file provides guidance to Claude Code when working with this repository.
 ## 快速开始
 
 ```bash
-# 安装依赖（使用 uv）
 uv pip install -r requirements.txt
 uv run playwright install chromium
 
