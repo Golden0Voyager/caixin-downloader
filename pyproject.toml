@@ -9,6 +9,10 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.12",
+    "ebooklib>=0.18",
+    "playwright>=1.40",
+    "questionary>=2.0",
+    "rich>=13.0",
 ]
 
 [build-system]
