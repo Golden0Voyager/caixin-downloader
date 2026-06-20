@@ -1,13 +1,14 @@
 import asyncio
 import json
 import re
+
 from playwright.async_api import async_playwright
 
 
 async def test_caixin_login():
     print("🚀 启动财新 Cookie 测试...")
 
-    with open("cookies.json", "r") as f:
+    with open("cookies.json") as f:
         cookies = json.load(f)
 
     pw_cookies = []
