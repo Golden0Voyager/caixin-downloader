@@ -463,6 +463,49 @@ class TestScrapeArticleImages:
         art = await _run(FakePage(html=html), mgr=mgr)
         assert 'alt="配图"' in art["html"]
 
+    @pytest.mark.asyncio
+    async def test_multiple_images_in_one_container_are_all_kept(self) -> None:
+        """同一个 cximg 轮播容器里的多张图都要保留。
+
+        2025-08-02 那篇实测：展开「余下全文」后同一容器内出现两张不同 URL 的图。
+        旧实现按 img 逐个 replace_with，第二张的目标节点已被摘出树，
+        bs4 抛 "Cannot replace one element with another when the element to be
+        replaced is not part of a tree"，整篇文章被 except 吞掉、静默消失。
+        """
+        html = (
+            '<html><body><div id="Main_Content_Val">'
+            "<p>" + "正文内容，足够长的段落。" * 6 + "</p>"
+            '<cximg><img src="https://img.caixin.com/1.jpg"/>'
+            '<img src="https://img.caixin.com/2.jpg"/></cximg>'
+            "</div></body></html>"
+        )
+        mgr = FakeImageManager({
+            **_image_entry("https://img.caixin.com/1.jpg", "images/1.jpg"),
+            **_image_entry("https://img.caixin.com/2.jpg", "images/2.jpg"),
+        })
+        art = await _run(FakePage(html=html), mgr=mgr)
+        assert art is not None, "多图容器不该让整篇抓取失败"
+        assert "cximg" not in art["html"], "原始容器应被替换掉"
+        assert art["html"].count('class="article-figure"') == 2
+        assert "images/1.jpg" in art["html"] and "images/2.jpg" in art["html"]
+
+    @pytest.mark.asyncio
+    async def test_one_failed_image_does_not_kill_its_siblings(self) -> None:
+        """同组里某张图下载失败，只丢它自己，其余图与正文都要留下。"""
+        html = (
+            '<html><body><div id="Main_Content_Val">'
+            "<p>" + "正文内容，足够长的段落。" * 6 + "</p>"
+            '<cximg><img src="https://img.caixin.com/ok.jpg"/>'
+            '<img src="https://img.caixin.com/dead.jpg"/></cximg>'
+            "</div></body></html>"
+        )
+        mgr = FakeImageManager(_image_entry("https://img.caixin.com/ok.jpg", "images/ok.jpg"))
+        art = await _run(FakePage(html=html), mgr=mgr)
+        assert art is not None
+        assert "images/ok.jpg" in art["html"]
+        assert "images/dead.jpg" not in art["html"]
+        assert "正文内容，足够长的段落" in art["html"], "正文不能因图片失败被丢"
+
 
 class TestScrapeArticleCompleteness:
     @pytest.mark.asyncio
