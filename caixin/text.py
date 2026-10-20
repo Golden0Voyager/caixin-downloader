@@ -156,12 +156,18 @@ def strip_section_prefix(title, section):
 
     `专栏｜`「随笔｜」「前瞻｜」这类是**体裁标记**而不是栏目（同一栏目下会混着
     好几种），保留 —— 读者靠它快速分辨正文与专栏。
+
+    前缀还会带「最新」二字（`最新封面报道｜售电巨亏谁埋单？`），是期页的编辑习惯，
+    不是标题的一部分。第 40 期 27 条里有 12 条是这种，漏掉会让目录显得很脏。
     """
-    for prefix in ("财新周刊", section or ""):
-        if prefix and title.startswith(prefix + "｜"):
-            stripped = title[len(prefix) + 1:].strip()
-            if stripped:
-                return stripped
+    for base in ("财新周刊", section or ""):
+        if not base:
+            continue
+        for prefix in (base, "最新" + base):
+            if title.startswith(prefix + "｜"):
+                stripped = title[len(prefix) + 1:].strip()
+                if stripped:
+                    return stripped
     return title
 
 
