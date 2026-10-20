@@ -303,35 +303,67 @@ async def scrape_article(page, url, image_manager, default_title=None, section="
 
         if img_urls:
             local_paths = await asyncio.gather(*[image_manager.download(u) for u in img_urls])
-            for idx, img in enumerate(img_tags):
-                path = local_paths[idx]
-                if path:
-                    # 构建干净的 figure 结构；装饰图（文末「财」字标志、署名图标）单独标类，按小尺寸展示
-                    is_marker = bool((image_manager.images.get(img_urls[idx]) or {}).get("is_marker"))
-                    figure = soup.new_tag("figure", attrs={
-                        "class": "article-figure article-figure--marker" if is_marker else "article-figure"})
-                    # alt 必须有：没有 alt 的 <img> 在屏幕阅读器里会念出整条文件名
-                    # （md5 十六进制串）。装饰图是纯设计元素，给空 alt 让它被跳过。
-                    alt_text = "" if is_marker else (img_captions[idx] or "配图")
-                    new_img = soup.new_tag("img", attrs={
-                        "src": path, "alt": alt_text,
-                        "class": "article-img article-img--marker" if is_marker else "article-img"})
-                    figure.append(new_img)
 
-                    if img_captions[idx]:
-                        # 样式全部交给 CSS 的 figcaption.article-caption（带 !important），
-                        # 这里不再写内联 style —— 否则与 CSS 打架，且是无效死代码。
-                        fcap = soup.new_tag("figcaption", attrs={"class": "article-caption"})
-                        fcap.string = img_captions[idx]
-                        figure.append(fcap)
+            def _build_figure(idx: int):
+                # 构建干净的 figure 结构；装饰图（文末「财」字标志、署名图标）单独标类，按小尺寸展示
+                is_marker = bool((image_manager.images.get(img_urls[idx]) or {}).get("is_marker"))
+                figure = soup.new_tag("figure", attrs={
+                    "class": "article-figure article-figure--marker" if is_marker else "article-figure"})
+                # alt 必须有：没有 alt 的 <img> 在屏幕阅读器里会念出整条文件名
+                # （md5 十六进制串）。装饰图是纯设计元素，给空 alt 让它被跳过。
+                alt_text = "" if is_marker else (img_captions[idx] or "配图")
+                new_img = soup.new_tag("img", attrs={
+                    "src": local_paths[idx], "alt": alt_text,
+                    "class": "article-img article-img--marker" if is_marker else "article-img"})
+                figure.append(new_img)
 
-                    # 替换：如果有容器则替换容器，否则替换 img 本身
-                    target = img_containers[idx] if img_containers[idx] else img
-                    target.replace_with(figure)
+                if img_captions[idx]:
+                    # 样式全部交给 CSS 的 figcaption.article-caption（带 !important），
+                    # 这里不再写内联 style —— 否则与 CSS 打架，且是无效死代码。
+                    fcap = soup.new_tag("figcaption", attrs={"class": "article-caption"})
+                    fcap.string = img_captions[idx]
+                    figure.append(fcap)
+                return figure
+
+            # ⚠️ 财新的多图轮播组件把几张 <img> 放在同一个 cximg / article_img_container 里
+            # （2025-08-02 那篇实测：展开「余下全文」后同一容器内出现两张不同 URL 的图）。
+            # 容器只能整体替换一次：若按 img 逐个 replace_with，第二个 img 的目标节点
+            # 已被摘出树，bs4 抛 "Cannot replace one element with another when the element
+            # to be replaced is not part of a tree"，整篇文章会被上面的 except 吞掉、
+            # 静默消失。所以先按容器分组，整组替换成一个装有多张 figure 的 div。
+            grouped: dict[int, list[int]] = {}
+            singles: list[int] = []
+            for idx in range(len(img_tags)):
+                container = img_containers[idx]
+                if container is None:
+                    singles.append(idx)
                 else:
-                    # 下载失败或已判定为装饰性图标：删除容器或 img
-                    target = img_containers[idx] if img_containers[idx] else img
-                    target.decompose()
+                    grouped.setdefault(id(container), []).append(idx)
+
+            for idxs in grouped.values():
+                container = img_containers[idxs[0]]
+                try:
+                    wrapper = soup.new_tag("div")
+                    for idx in idxs:
+                        if local_paths[idx]:
+                            wrapper.append(_build_figure(idx))
+                        # 下载失败：只丢这一张，不牵连同容器的其他图
+                    if wrapper.contents:
+                        container.replace_with(wrapper)
+                    else:
+                        container.decompose()
+                except Exception as e:  # noqa: BLE001
+                    console.log(f"[yellow]⚠️ 图片替换失败，已跳过该图组: {e}[/yellow]")
+
+            for idx in singles:
+                try:
+                    if local_paths[idx]:
+                        img_tags[idx].replace_with(_build_figure(idx))
+                    else:
+                        # 下载失败或已判定为装饰性图标：删除 img
+                        img_tags[idx].decompose()
+                except Exception as e:  # noqa: BLE001
+                    console.log(f"[yellow]⚠️ 图片替换失败，已跳过: {e}[/yellow]")
 
         # 清理因图片被丢弃而留下的空容器（否则 .article-figure 的 margin 会撑出空白）
         for tag in content_div.find_all(["figure", "a"]):
