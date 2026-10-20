@@ -1,8 +1,9 @@
 [project]
 name = "caixin-downloader"
-version = "0.1.0"
-description = "Add your description here"
+version = "2.5"
+description = "财新周刊全自动 EPUB 下载引擎：抓取已订阅内容并打包为离线电子书"
 readme = "README.md"
+license = { text = "MIT" }
 authors = [
     { name = "Haining", email = "yhn0535@gmail.com" }
 ]
@@ -10,18 +11,22 @@ requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.12",
     "ebooklib>=0.18",
+    "pillow>=10.0",
     "playwright>=1.40",
     "questionary>=2.0",
     "rich>=13.0",
 ]
 
-[build-system]
-requires = ["uv_build>=0.9.17,<0.10.0"]
-build-backend = "uv_build"
+# 这是一个脚本项目，不是可安装的库：`uv run python main.py` 直接用源码树运行。
+# 之前的配置声明了 uv_build + src/ 布局，但 src/caixin_downloader 里只有一句
+# hello()，`uv build` 出来的 wheel 不含任何实际代码。
+[tool.uv]
+package = false
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
     "ruff>=0.5.0",
     "mypy>=1.10.0",
@@ -30,17 +35,24 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# 抓取层全是 async 函数，用 auto 模式可以直接写 `async def test_...`，
+# 不必给每个用例贴 @pytest.mark.asyncio。
+asyncio_mode = "auto"
 
 [tool.coverage.run]
+# 只统计产品代码。此前写的是 source = ["."] 且没排除测试，于是分母里混进了
+# 三个接近 100% 覆盖的测试文件，总数被抬到 52%，而 main.py 实际只有 26%。
 source = ["."]
-omit = ["test_caixin.py"]
+omit = ["tests/*", "test_caixin.py"]
+branch = true
 
 [tool.coverage.report]
-# 个人实验 Demo 项目，870 行单体脚本深度绑定 Playwright，
-# 核心风险来自外部网站而非代码逻辑。仅 create_epub 可单元测试，
-# 余下代码需要重构才能达到更高覆盖率。
-fail_under = 15
+# 门槛设在当前水位（97%）下方留出余量：新增一两处未测分支不至于立刻红，
+# 但成片退化一定会被 CI 拦住。抓取链路的 Playwright 交互已由 tests/fakes.py
+# 的离线替身覆盖，不再是「只能人工点」的黑箱。
+fail_under = 90
 show_missing = true
+skip_covered = true
 
 [tool.ruff]
 target-version = "py312"

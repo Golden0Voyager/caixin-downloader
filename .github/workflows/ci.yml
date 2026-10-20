@@ -23,20 +23,27 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
-      - name: Run ruff check
-        run: uv run ruff check main.py src/
+      # 以下四道门禁都**不再带 `|| true`** —— 带上就等于装饰。
+      # 之前的配置里 mypy / bandit / 依赖审计三步全被吞掉，其中 `uv audit`
+      # 在 uv 0.9.x 里根本不存在这个子命令，等于每次都在静默失败。
 
-      - name: Run mypy
-        run: uv run mypy main.py src/ || true
-      - name: Run security scan (bandit)
-        run: uv tool run bandit -r . || true
+      - name: Lint (ruff)
+        run: uv run ruff check .
 
-      - name: Run dependency audit
-        run: uv audit || true
+      - name: Type check (mypy)
+        run: uv run mypy main.py caixin/
 
+      # -ll：只拦 MEDIUM 及以上。caixin/ 里剩两条 LOW（有意为之的
+      # try/except 清理），不该让它们挡住合并。
+      # 扫 caixin/ 而不只是 main.py —— 拆包后 main.py 只剩 30 行，扫它等于没扫。
+      - name: Security scan (bandit)
+        run: uv tool run bandit -r caixin/ main.py -q -ll
 
-      - name: Run tests with coverage
-        run: uv run pytest --cov --cov-report=term-missing tests/
+      - name: Dependency audit (pip-audit)
+        run: uv run --with pip-audit pip-audit
+
+      - name: Tests with coverage
+        run: uv run pytest --cov --cov-report=term-missing
 
       - name: Enforce coverage threshold
         run: uv run coverage report

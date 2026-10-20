@@ -1,0 +1,136 @@
+/* ══ 排版尺度（em 表达 · 20px 基准 · 3 的倍数网格）════════════
+   全部长度用 em，字号与间距都跟随阅读器的字号设置等比缩放。
+   基准：body { font-size: 1.25em } —— 阅读器默认通常是 16px，
+   1.25 × 16 = 20px。下面所有 em 都是相对这 20px 说的。
+
+   为什么基准取 20px：要让「em × 基准」恒为 3 的倍数、同时 em 又是整洁的
+   两位小数，最小步长 = 300 / gcd(300, 基准)：
+       18px → 0.5em（9px，太粗，字号只剩 1 / 1.5 / 2）
+       20px → 0.15em（3px，正好）   ← 本文件采用
+       21px → 1.0em（21px，不可用）
+   于是字号阶梯全部落在两位小数上，且相邻比值逐级递减（≈φ 的排法）：
+       1.8em  = 36px   .article-title  文章标题   = 正文 × 1.8
+       1.5em  = 30px   .toc-header     目录大标题 = 正文 × 1.5
+       1.2em  = 24px   h2              二级标题   = 正文 × 1.2
+       1.05em = 21px   h3              三级标题   = 正文 × 1.05
+       1em    = 20px   正文 / h4 / 导语 / 引语      基准
+       0.75em = 15px   署名 / 表格 / 按钮
+       0.6em  = 12px   图注 / 作者栏 / 目录副标题
+
+   间距换算回 px 同样只取 3 的倍数：
+       3 6 9 12 15 18 21 24 27 30 33 36 45 48 …
+   注意 em 的解析规则：间距的 em 相对**元素自己的** font-size。
+   所以同一个「12px」在 20px 的段落里是 0.6em，在 12px 的图注里是 1em ——
+   下面每条都按各自字号算过。元素字号越大，其间距的 em 粒度越粗
+   （20px→0.15、30px→0.1、24px→0.25、21px→0.1429、36px→0.0833）。
+
+   例外：text-indent: 2em 是「两个字符宽」而非设计网格值，恒为 2em。
+
+   行高一律用无单位倍数（line-height: 1.8 这类）：它按「倍数」继承，
+   子元素各自拿自己的字号去乘，不会像 em 那样算死一个值再复利下去。
+
+   本文件里**不允许出现 px**（发丝线 1px 除外，见各条 border），
+   tests/test_create_epub.py 会校验字号与间距换算回 px 后仍是 3 的倍数。
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── 页面基础 ── */
+html { margin: 0; padding: 0; }
+body { margin: 0; padding: 0; color: #1a1a1a; text-align: justify;
+       font-family: "Songti SC", "STSong", "Source Han Serif SC", "Noto Serif CJK SC", "PingFang SC", serif;
+       font-size: 1.25em; line-height: 1.8;
+       /* 中文两端对齐：按表意文字间距拉伸，避免西文单词被拉出大空隙 */
+       text-justify: inter-ideograph;
+       /* 长 URL / 连续西文换行，不撑破版心 */
+       overflow-wrap: break-word; word-wrap: break-word;
+       hyphens: none; -webkit-text-size-adjust: 100%; }
+/* 版心左右留白 + 行长上限。纯百分比相对视口宽度：手机上 6% 只有 ~24px 显得贴边，
+   iPad 横屏 6% 又宽到离谱。用 max() 取「6% 与 1.5em(30px)」中较大者 ——
+   窄屏靠 em 保证光学边距，宽屏靠百分比约束行长。
+   不支持 max() 的旧引擎会退回上一行的 6%。
+   max-width: 33em(=660px) 是宽屏下的行长上限：中文长文一行 33 字左右最好读，
+   不设上限时 iPad 横屏一行能到 70 字，眼睛回到行首会串行。超宽时 margin:auto 居中。 */
+.page { margin: 0 auto; padding: 0 6%; padding: 0 max(6%, 1.5em); max-width: 33em; }
+
+/* ── 封面 ── */
+.cover-page { margin: 0; padding: 0; text-align: center; }
+.cover-img { display: block; width: 100%; height: auto; max-height: 100vh; margin: 0 auto; object-fit: contain; }
+
+/* ── 目录页 ── */
+.toc-container { padding-top: 1.8em; padding-bottom: 2.4em; text-align: left; }
+.toc-header { font-size: 1.5em; font-weight: bold; line-height: 1.3; padding-bottom: 0.4em; margin: 0 0 0.4em 0; border-bottom: 0.1em solid #1f286f; letter-spacing: 0.02em; }
+.toc-meta { font-size: 0.6em; line-height: 1.5; color: #8a8a8e; letter-spacing: 0.08em; margin: 0 0 3em 0; }
+.toc-list { list-style: none; padding: 0; margin: 0; }
+/* 栏目分组。期页的栏目（封面报道 / 金融 / 商业 …）决定目录的骨架，
+   小标题用小字号 + 品牌色 + 字距撑开，视觉上像一条分隔标签。 */
+.toc-group { margin: 0 0 1.5em 0; }
+.toc-group:last-child { margin-bottom: 0; }
+.toc-group-title { font-size: 0.6em; line-height: 1.5; color: #1f286f; font-weight: bold; letter-spacing: 0.12em; margin: 0 0 0.5em 0; padding-bottom: 0.5em; border-bottom: 1px solid #e2e2e6; }
+.toc-item { display: block; margin: 0; padding: 0.6em 0; border-bottom: 1px solid #f0f0f2; text-decoration: none; color: #222; }
+.toc-item-title { font-size: 1em; line-height: 1.5; text-indent: 0; }
+.toc-index { display: inline-block; min-width: 2.1em; color: #1f286f; font-weight: bold; }
+
+/* ── 文章头 ── */
+.article-header { margin: 2.25em 0 1.8em 0; text-align: center; }
+.article-title { font-size: 1.8em; font-weight: bold; line-height: 1.25; margin: 0 0 0.25em 0; letter-spacing: 0.01em; text-align: center; }
+.author-bar { font-size: 0.6em; line-height: 1.5; color: #8a8a8e; text-align: center; margin: 1.25em 0 0 0; letter-spacing: 0.05em; }
+/* 标题下的品牌色短横线 */
+.article-header::after { content: ""; display: block; width: 2.25em; height: 0.15em; background: #1f286f; margin: 0.9em auto 0 auto; }
+
+/* ── 正文 ──
+   段落用「首行缩进 2 字符 + 小段距」的杂志式排版；段首的硬编码全角空格
+   已在抓取阶段剥掉，缩进只由 text-indent 产生（2em 恒等于两个字宽）。 */
+.content-body { orphans: 2; widows: 2; }
+.content-body p { margin: 0 0 0.6em 0; text-indent: 2em; orphans: 2; widows: 2; }
+/* 首段不缩进。注意 :first-of-type 只看标签不看类：有署名的章节里 byline
+   自己占掉了 first-of-type，正文第一段就变成了 nth-of-type(2) 而被缩进，
+   于是同一本书里两种首段处理。补一条相邻兄弟选择器兜住这种情况。 */
+.content-body p:first-of-type { text-indent: 0; }
+.content-body p.article-byline + p { text-indent: 0; }
+.content-body p.article-byline { font-size: 0.75em; line-height: 1.6; color: #6b6b70; letter-spacing: 0.02em; text-indent: 0; margin: 0 0 1.8em 0; }
+.content-body p.article-byline strong, .content-body p.article-byline b { font-weight: normal; color: inherit; }
+/* 导语 / 提要（财新正文的 .lead） */
+.content-body .lead, .content-body p.lead { font-size: 1em; line-height: 1.6667; color: #3a3a3e; text-indent: 0;
+    background: #f7f7f9; border-left: 0.15em solid #1f286f; padding: 0.75em 0.9em; margin: 0 0 1.5em 0; }
+/* 引语（.quote） */
+.content-body .quote, .content-body p.quote { font-size: 1em; color: #4a4a50; text-indent: 0;
+    border-left: 0.15em solid #c9c9d0; padding-left: 0.9em; margin: 0.9em 0; }
+.content-body h2 { font-size: 1.2em; font-weight: bold; line-height: 1.375; margin: 1.875em 0 0.75em 0; text-align: left; color: #1f286f; border-left: 0.125em solid #1f286f; padding-left: 0.5em; letter-spacing: 0.01em; page-break-after: avoid; break-after: avoid; }
+.content-body h3 { font-size: 1.05em; font-weight: bold; line-height: 1.4286; margin: 1.7143em 0 0.7143em 0; text-align: left; color: #333; border-left: 0.1429em solid #c9c9d0; padding-left: 0.5714em; page-break-after: avoid; break-after: avoid; }
+.content-body h4, .content-body h5, .content-body h6 { font-size: 1em; font-weight: bold; line-height: 1.5; margin: 1.65em 0 0.6em 0; text-align: left; color: #444; page-break-after: avoid; break-after: avoid; }
+.content-body blockquote { margin: 1.5em 0; padding: 0.75em 0.9em; background: #f7f7f9; border-left: 0.15em solid #c9c9d0; color: #555; page-break-inside: avoid; break-inside: avoid; }
+.content-body blockquote p { text-indent: 0; margin: 0 0 0.45em 0; }
+.content-body blockquote p:last-child { margin-bottom: 0; }
+.content-body strong, .content-body b { font-weight: bold; color: #000; }
+/* 中文不使用斜体：<em>/<i> 退化为正体，避免出现难看的伪斜体 */
+.content-body em, .content-body i { font-style: normal; color: #000; }
+.content-body a { color: #1a1a1a; text-decoration: underline; text-decoration-color: #b9b9c0; }
+.content-body ul, .content-body ol { margin: 0.9em 0; padding-left: 1.8em; }
+.content-body li { margin: 0.45em 0; text-indent: 0; }
+.content-body hr { border: 0; height: 0.15em; background: #e2e2e6; margin: 1.8em 1.5em; }
+.content-body sup, .content-body sub { font-size: 0.6em; line-height: 0; }
+/* 表格（财新数据类文章）—— font-size 0.75em = 15px，其内的 em 都以 15px 为基准 */
+.content-body table { width: 100%; border-collapse: collapse; margin: 2em 0; font-size: 0.75em; page-break-inside: avoid; break-inside: avoid; }
+.content-body th, .content-body td { border: 1px solid #e2e2e6; padding: 0.6em 0.8em; text-align: left; text-indent: 0; line-height: 1.6; }
+.content-body th { background: #f4f4f7; font-weight: bold; color: #1f286f; }
+.content-body caption { font-size: 0.8em; color: #8a8a8e; text-align: left; padding-bottom: 0.75em; }
+
+/* ── 图片 ──
+   figure 收缩到图片实际宽度（fit-content），这样图注的细线能与图片左右对齐，
+   而不是撑满整个版心。阅读器不支持 fit-content 时退化为整栏宽，不会坏版。 */
+.article-figure { margin: 1.8em auto; padding: 0; width: -webkit-fit-content; width: fit-content; max-width: 100%; page-break-inside: avoid; break-inside: avoid; }
+.article-figure + .article-figure { margin-top: 1.05em; }
+.article-img { width: auto !important; height: auto !important; max-width: 100% !important; max-height: 84vh !important; display: block; margin: 0 auto; padding: 0; }
+/* 段落内的行内小图（未被包成 figure 的） */
+.content-body p img { max-width: 100%; height: auto; }
+.article-figure--marker { margin: 1.8em auto 0.9em auto; width: auto; }
+/* 「财」字标志的真实素材只有 16×16，上限给 0.75em(=15px) 让它永不放大、按原生像素渲染最清晰 */
+.article-img--marker { max-width: 0.75em !important; max-height: 0.75em !important; opacity: 0.85; }
+figcaption.article-caption { font-family: "PingFang SC", "Helvetica Neue", "Hiragino Sans GB", "Microsoft YaHei", sans-serif !important; font-size: 0.6em !important; line-height: 1.5 !important; color: #8a8a8e !important; text-align: left !important; text-indent: 0 !important; margin: 1em 0 0 0 !important; padding: 0.75em 0 0 0 !important; border-top: 1px solid #e8e8ec !important; }
+
+/* ── 章末 ──
+   翻页条：上一篇 / 目录 / 下一篇。三个按钮同款，只有「目录」用实心感的深色文字，
+   让读者一眼认出回到目录的入口。 */
+.article-footer { margin-top: 2.7em; text-align: center; padding-bottom: 2.4em; }
+.pager-link, .back-to-toc { display: inline-block; padding: 0.8em 1.4em; border: 1px solid #c9c9d0; text-decoration: none; color: #444; font-size: 0.75em; letter-spacing: 0.06em; border-radius: 1.6em; margin: 0 0.2em; }
+.pager-link { color: #1f286f; }
+.back-to-toc { color: #444; }

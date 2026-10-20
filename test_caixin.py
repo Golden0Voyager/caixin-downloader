@@ -1,27 +1,27 @@
+"""Cookie 有效性自检脚本 —— **不是单元测试**。
+
+用法：
+    uv run python test_caixin.py
+
+它会真的打开浏览器访问 weekly.caixin.com，所以必须挡在 pytest 的收集之外
+（`__test__ = False`）：否则谁执行 `pytest test_caixin.py` 都会发起真实网络请求。
+"""
+
+__test__ = False
+
 import asyncio
 import json
 import re
 
 from playwright.async_api import async_playwright
 
+from caixin.cookies import load_cookies
+
 
 async def test_caixin_login():
     print("🚀 启动财新 Cookie 测试...")
 
-    with open("cookies.json") as f:
-        cookies = json.load(f)
-
-    pw_cookies = []
-    for c in cookies:
-        pc = {
-            "name": c["name"],
-            "value": c["value"],
-            "domain": c["domain"],
-            "path": c.get("path", "/"),
-        }
-        if "sameSite" in c and c["sameSite"] in ["Strict", "Lax", "None"]:
-            pc["sameSite"] = c["sameSite"]
-        pw_cookies.append(pc)
+    pw_cookies = load_cookies("cookies.json")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -52,7 +52,7 @@ async def test_caixin_login():
                     try:
                         api_json = json.loads(body)
                     except json.JSONDecodeError:
-                        m = re.search(r'[^(]+\((.+)\)\s*$', body, re.DOTALL)
+                        m = re.search(r"[^(]+\((.+)\)\s*$", body, re.DOTALL)
                         if m:
                             api_json = json.loads(m.group(1))
 
@@ -61,7 +61,7 @@ async def test_caixin_login():
                         api_result["status"] = api_json.get("data", "")
                         if api_json.get("code") == 0 and api_json.get("data"):
                             data_str = api_json["data"]
-                            cm = re.search(r'resetContentInfo\((.+)\)$', data_str, re.DOTALL)
+                            cm = re.search(r"resetContentInfo\((.+)\)$", data_str, re.DOTALL)
                             if cm:
                                 inner = json.loads(cm.group(1))
                                 api_result["content_length"] = len(inner.get("content", ""))
@@ -76,7 +76,7 @@ async def test_caixin_login():
         if api_result.get("code") == 0 and api_result.get("content_length", 0) > 500:
             print(f"✅ 测试成功！API 认证通过，返回正文长度 {api_result['content_length']} 字符")
             print("   Cookies 有效，可以正常抓取原文")
-        elif api_result.get("code") == -1 or api_result.get("code") != 0:
+        elif api_result.get("code") is not None and api_result.get("code") != 0:
             print(f"❌ 测试失败！API 返回 code={api_result.get('code')}，Cookies 已失效")
             print("   请重新登录财新网站，导出新的 cookies.json")
         else:

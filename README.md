@@ -11,7 +11,7 @@
 ## 前置条件
 
 - **财新付费会员**：本工具仅辅助下载你已付费订阅的内容，不能绕过付费墙
-- **Python 3.10+**
+- **Python 3.12+**
 - **uv**（Python 包管理器）：[安装指南](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Cookie 获取教程
@@ -46,7 +46,8 @@
 git clone https://github.com/hainingyu/caixin-downloader.git
 cd caixin-downloader
 
-# 2. 安装依赖（含 Playwright 浏览器）
+# 2. 安装依赖 + Playwright 浏览器
+uv sync
 uv run playwright install chromium
 
 # 3. 将导出的 Cookie 放到项目根目录
@@ -66,8 +67,8 @@ uv run python main.py
 - **自动探测最新期号**，支持历史期刊翻页选择和批量下载
 - **封面自动获取**，EPUB 内嵌当期杂志封面
 - **图片离线嵌入**，断网也能阅读完整图文
-- **杂志级排版**：1.85 倍行高、两端对齐、首段去缩进，适配 Kindle / iPad 双页模式
-- **自定义目录页 + 空白过渡页**，在双页模式下目录与正文物理隔离
+- **杂志级排版**：20px 基准字号、1.8 倍行高、两端对齐、首段去缩进，字号与间距全部用 `em` 跟随阅读器缩放
+- **自定义目录页**，带编号与期号/篇数信息，在双页模式下与正文物理隔离
 - **智能重试**和并发控制，稳定抓取 20~30 篇/期
 - **Rich 终端界面**，带进度条和彩色输出
 

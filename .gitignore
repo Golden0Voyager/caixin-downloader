@@ -7,7 +7,11 @@ __pycache__/
 .coverage
 htmlcov/
 download/
+# 登录凭据：cookies.json 及其所有备份/变体都必须忽略。
+# 只写 cookies.json 会漏掉 cookies.json.bak.* —— 那里同样是真实的会话 token。
 cookies.json
+cookies.json.*
+cookies*.json
 *.epub
 .gemini/
 .agents/
@@ -15,3 +19,6 @@ cookies.json
 # Skill-generated analysis artifacts
 .understand-anything/
 .codegraph/
+
+# 本地 AI 协作记忆/日志：含调试过程与路径信息，不进公共仓库
+.workbuddy-ai/
