@@ -22,3 +22,7 @@ cookies*.json
 
 # 本地 AI 协作记忆/日志：含调试过程与路径信息，不进公共仓库
 .workbuddy-ai/
+
+# 子项目 worktree（/Code/AGENTS.md 强制流程）：必须在建 worktree 前就忽略，
+# 否则主 checkout 会多出 `?? .worktrees/`
+.worktrees/
