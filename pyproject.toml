@@ -55,12 +55,14 @@ show_missing = true
 skip_covered = true
 
 [tool.ruff]
-target-version = "py312"
-line-length = 120
+# 继承仓库内基线（见 .ruff-global.toml，镜像自 ~/.config/ruff/ruff.toml）。
+# 不直接 extend 用户级路径：ruff 找不到被继承文件会硬失败，而 CI 上没有该文件。
+extend = ".ruff-global.toml"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
-ignore = ["E501", "E701", "E702", "N999"]
+# 只声明与基线的差异：本项目额外放行多语句同行（E701/E702）与非 snake_case 模块名（N999）。
+# E501 与 SIM102/103/108/117 的忽略已在基线里，不再重复。
+extend-ignore = ["E701", "E702", "N999"]
 
 [tool.mypy]
 ignore_missing_imports = true
