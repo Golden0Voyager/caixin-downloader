@@ -1,0 +1,13 @@
+# 共享 ruff 基线 —— 与工作区 `~/.config/ruff/ruff.toml` 保持同步。
+#
+# 为什么不直接写 `extend = "~/.config/ruff/ruff.toml"`：
+# ruff 在找不到被继承的文件时是**硬失败**（不是警告），而 GitHub Actions 上没有这个
+# 用户级文件，CI 会直接红。所以把基线提交到仓库，本地与 CI 读同一份，避免「本地绿、CI 红」。
+#
+# 全局规则变更时，同步修改本文件与 `~/.config/ruff/ruff.toml`。
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "SIM102", "SIM103", "SIM108", "SIM117"]
